@@ -12,7 +12,7 @@ I have been writing shell scripts for as long as I have been writing software, a
 
 This bothers me more than usual when I am working in Nix. You have this extraordinary system for reproducible, typed, compositional software construction, and then right at the edges of it, where the actual work gets done, you have bash scripts. The Nix language is purely functional and quite elegant. The builds are hermetic, the dependency graph is tracked with mathematical precision. And then you write your deployment scripts and you are back in 1989.
 
-A few months ago I found Chris Done's Hell: take the Haskell type checker, strip out everything that makes Haskell complicated, and expose the result as a scripting language. The entire implementation fits in one file. You write do-notation, call processes, manipulate files, and the type checker tells you when you have made a mistake before you run the script on your production database.
+A few days ago I found Chris Done's Hell: take the Haskell type checker, strip out everything that makes Haskell complicated, and expose the result as a scripting language. The entire implementation fits in one file. You write do-notation, call processes, manipulate files, and the type checker tells you when you have made a mistake before you run the script on your production database.
 
 So I am forking Hell and calling it Nix-Hell. The core language stays exactly as Chris designed it. What I am adding is a layer of Nix-specific primitives and types: a `StorePath` type that the checker distinguishes from plain text, a `Secret` type that cannot accidentally flow into a log message, and first-class primitives for store operations, flake evaluation, and system management.
 
