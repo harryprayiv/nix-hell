@@ -4,7 +4,7 @@ main = do
   let plaintext = "hello secret world"
   ciphertext <- Age.encrypt (Text.strip pubkey) plaintext
   Text.putStrLn "encrypted successfully"
-  secret <- Age.decrypt ciphertext
+  secret <- Age.decrypt "/tmp/test.key" ciphertext
   let recovered = Secret.toEnvValue secret
   if Eq.eq recovered plaintext
     then Text.putStrLn "PASS: roundtrip succeeded"

@@ -319,12 +319,12 @@ age_encrypt pubkey plaintext = do
       error $ "Age.encrypt failed: "
            <> Text.unpack (Text.decodeUtf8 (L.toStrict err))
 
-age_decrypt :: ByteString -> IO Secret
-age_decrypt ciphertext = do
+age_decrypt :: Text -> ByteString -> IO Secret
+age_decrypt identityFile ciphertext = do
   (code, out, err) <- readProcess
     (setStdin
       (byteStringInput (L.fromStrict ciphertext))
-      (proc "age" ["--decrypt"]))
+      (proc "age" ["--decrypt", "--identity", Text.unpack identityFile]))
   case code of
     ExitSuccess   ->
       pure $ Secret $ Text.decodeUtf8 $ L.toStrict out
