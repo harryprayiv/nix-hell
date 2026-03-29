@@ -1,9 +1,9 @@
-name: hell
-version: 666.20251111
+name: nix-hell
+version: 666.20260328
 license: BSD3
 author: "Chris Done"
-copyright: "2023 Chris Done"
-synopsis: "Haskell-based shell scripting language"
+copyright: "2024 Chris Done, 2026 Harry Pray IV"
+synopsis: "Haskell-based shell scripting language with Nix primitives"
 dependencies:
 - base >=4.17.2.1 && <4.22
 - haskell-src-exts
@@ -32,22 +32,33 @@ dependencies:
 - temporary
 - these
 - time
+- filepath
+- unix
 
 ghc-options:
   - -Wall
   - -Wno-missing-pattern-synonym-signatures
   - -O2
 
+library:
+  source-dirs: src
+  exposed-modules:
+    - NixHell
+
 executables:
-  hell:
+  nix-hell:
     main: src/Hell.hs
+    dependencies:
+      - nix-hell
     ghc-options:
       - -threaded
       - -rtsopts
 
 tests:
-  hell-test:
+  nix-hell-test:
     main: src/Hell.hs
+    dependencies:
+      - nix-hell
     ghc-options:
       - -main-is
       - Main.specMain

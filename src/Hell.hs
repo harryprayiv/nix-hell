@@ -121,6 +121,7 @@ import qualified Text.Show as Show
 import Type.Reflection (SomeTypeRep (..), TypeRep, typeRep, typeRepKind, pattern TypeRep)
 import qualified Type.Reflection as Type
 import qualified UnliftIO.Async as Async
+import qualified NixHell
 
 ------------------------------------------------------------------------------
 -- Main entry point
@@ -824,6 +825,9 @@ instances =
         instance0 @Show @Text,
         instance0 @Show @ByteString,
         instance0 @Show @ExitCode,
+        instance0 @Show @NixHell.StorePath,
+        instance0 @Eq   @NixHell.StorePath,
+        instance0 @Ord  @NixHell.StorePath,
         instance0 @Eq @Int,
         instance0 @Eq @Integer,
         instance0 @Eq @Day,
@@ -1595,7 +1599,9 @@ supportedTypeConstructors =
       ("hell:Hell.Variant", SomeTypeRep $ typeRep @Variant),
       ("hell:Hell.Record", SomeTypeRep $ typeRep @Record),
       ("hell:Hell.Tagged", SomeTypeRep $ typeRep @Tagged),
-      ("hell:Hell.Nullary", SomeTypeRep $ typeRep @Nullary)
+      ("hell:Hell.Nullary", SomeTypeRep $ typeRep @Nullary),
+      ("StorePath", SomeTypeRep $ typeRep @NixHell.StorePath),
+      ("Secret",    SomeTypeRep $ typeRep @NixHell.Secret)
     ]
 
 -- | Used for constructors with no slot. E.g. True :: Nullary -> Bool
@@ -1780,6 +1786,57 @@ supportedLits =
       lit' "Options.switch" Options.switch,
       lit' "Options.strOption" (Options.strOption @Text),
       lit' "Options.strArgument" (Options.strArgument @Text)
+      -- StorePath
+      lit' "StorePath.fromText"      NixHell.storePath_fromText,
+      lit' "StorePath.toText"        NixHell.storePath_toText,
+      -- Nix store
+      lit' "Nix.build"               NixHell.nix_build,
+      lit' "Nix.buildFlakeAttr"      NixHell.nix_buildFlakeAttr,
+      lit' "Nix.storeAdd"            NixHell.nix_storeAdd,
+      lit' "Nix.isInStore"           NixHell.nix_isInStore,
+      lit' "Nix.queryRequisites"     NixHell.nix_queryRequisites,
+      lit' "Nix.copy"                NixHell.nix_copy,
+      lit' "Nix.sign"                NixHell.nix_sign,
+      -- Nix eval and flake
+      lit' "Nix.eval"                NixHell.nix_eval,
+      lit' "Nix.evalFlakeAttr"       NixHell.nix_evalFlakeAttr,
+      lit' "Nix.instantiate"         NixHell.nix_instantiate,
+      lit' "Nix.flakeMetadata"       NixHell.nix_flakeMetadata,
+      lit' "Nix.flakeUpdate"         NixHell.nix_flakeUpdate,
+      lit' "Nix.flakeLock"           NixHell.nix_flakeLock,
+      lit' "Nix.flakeInputs"         NixHell.nix_flakeInputs,
+      -- Profile and GC
+      lit' "Nix.profileInstall"      NixHell.nix_profileInstall,
+      lit' "Nix.profileRemove"       NixHell.nix_profileRemove,
+      lit' "Nix.gcCollect"           NixHell.nix_gcCollect,
+      lit' "Nix.gcRoots"             NixHell.nix_gcRoots,
+      lit' "Nix.optimiseStore"       NixHell.nix_optimiseStore,
+      -- Sops
+      lit' "Sops.get"                NixHell.sops_get,
+      lit' "Sops.getAll"             NixHell.sops_getAll,
+      lit' "Secret.toEnvValue"       NixHell.secret_toEnvValue,
+      lit' "Secret.writeFile"        NixHell.secret_writeFile,
+      -- Age
+      lit' "Age.encrypt"             NixHell.age_encrypt,
+      lit' "Age.decrypt"             NixHell.age_decrypt,
+      lit' "Ssh.toAge"               NixHell.ssh_toAge,
+      -- Shell safety
+      lit' "Shell.escape"            NixHell.shell_escape,
+      lit' "Shell.escapeList"        NixHell.shell_escapeList,
+      lit' "Shell.which"             NixHell.shell_which,
+      lit' "Shell.inPath"            NixHell.shell_inPath,
+      -- NixOS
+      lit' "NixOS.rebuild"           NixHell.nixos_rebuild,
+      lit' "NixOS.currentSystem"     NixHell.nixos_currentSystem,
+      lit' "NixOS.option"            NixHell.nixos_option,
+      lit' "NixOS.generations"       NixHell.nixos_generations,
+      lit' "NixOS.rollback"          NixHell.nixos_rollback,
+      -- Systemd
+      lit' "Systemd.status"          NixHell.systemd_status,
+      lit' "Systemd.start"           NixHell.systemd_start,
+      lit' "Systemd.stop"            NixHell.systemd_stop,
+      lit' "Systemd.restart"         NixHell.systemd_restart,
+      lit' "Systemd.logs"            NixHell.systemd_logs
     ]
   where
     lit' :: forall a. (Type.Typeable a) => String -> a -> (String, (UTerm (), SomeTypeRep))
