@@ -6,7 +6,7 @@ Nix-Hell is a fork of the hell shell scripting language (a tiny dialect of Haske
 See [homepage](https://chrisdone.github.io/hell/) for documentation, downloads, architecture, etc.
 
 
-# $ Back Story:
+# # Back Story:
 
 I have been writing shell scripts for as long as I have been writing software, and I have never liked it. Bash is remarkable in the sense that it has survived decades of abuse and still mostly works, but let us be honest: it is a terrible programming language. The quoting rules are a disaster. The error handling is opt-in and routinely forgotten. The type system is "everything is a string, good luck."
 
