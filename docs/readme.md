@@ -18,6 +18,6 @@ So I am forking Hell and calling it Nix-Hell. The core language stays exactly as
 
 The great insight I am borrowing from Hell is that scripting languages do not need to be powerful. They need to be correct. A language that distinguishes `StorePath` from `Text` and `Secret` from `Text` is already dramatically safer than bash without needing anything more sophisticated than a simply-typed lambda calculus.
 
-The Nix ecosystem deserves a scripting language that understands it. Hell gave us the foundation. Nix-Hell is what you build on top.
+The Nix ecosystem deserves a scripting language that understands it. Hell gave us the stable foundation. Nix-Hell is what I will build on top of that stable foundation.
 
 Code coming shortly. Collaborators welcome.
