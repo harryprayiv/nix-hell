@@ -1,0 +1,9 @@
+#!/usr/bin/env nix-hell
+main = do
+  roots <- Nix.gcRoots
+  Text.putStrLn ("gc roots: " <> Show.show (List.length roots))
+  Monad.forM_ (List.take 5 roots) \r ->
+    Text.putStrLn ("  " <> StorePath.toText r)
+  path <- Nix.build "nixpkgs#hello"
+  inStore <- Nix.isInStore (StorePath.toText path)
+  Text.putStrLn ("hello in store: " <> Show.show inStore)

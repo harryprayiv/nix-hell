@@ -1,0 +1,8 @@
+#!/usr/bin/env nix-hell
+main = do
+  path <- Nix.build "nixpkgs#hello"
+  Text.putStrLn ("built: " <> StorePath.toText path)
+  reqs <- Nix.queryRequisites path
+  Text.putStrLn ("requisites: " <> Show.show (List.length reqs))
+  Monad.forM_ reqs \r ->
+    Text.putStrLn ("  " <> StorePath.toText r)

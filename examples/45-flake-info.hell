@@ -1,0 +1,8 @@
+#!/usr/bin/env nix-hell
+main = do
+  inputs <- Nix.flakeInputs "."
+  Text.putStrLn ("flake inputs (" <> Show.show (Map.size inputs) <> "):")
+  Monad.forM_ (Map.toList inputs) \(k, v) ->
+    Text.putStrLn ("  " <> k <> " -> " <> v)
+  meta <- Nix.flakeMetadata "."
+  Text.putStrLn ("metadata: " <> Text.decodeUtf8 (Json.encode meta))

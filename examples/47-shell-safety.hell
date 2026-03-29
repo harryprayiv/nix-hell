@@ -1,0 +1,12 @@
+#!/usr/bin/env nix-hell
+main = do
+  let dangerous = "hello; rm -rf /"
+  let safe = Shell.escape dangerous
+  Text.putStrLn ("escaped: " <> safe)
+  let args = ["foo bar", "it's quoted", "normal"]
+  Text.putStrLn ("list: " <> Shell.escapeList args)
+  mnix <- Shell.which "nix"
+  Maybe.maybe
+    (Text.putStrLn "nix not found")
+    (\p -> Text.putStrLn ("nix at: " <> StorePath.toText p))
+    mnix

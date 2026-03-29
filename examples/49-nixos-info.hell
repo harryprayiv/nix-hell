@@ -1,0 +1,7 @@
+#!/usr/bin/env nix-hell
+main = do
+  sys <- NixOS.currentSystem
+  Text.putStrLn ("current system: " <> StorePath.toText sys)
+  out <- Process.runProcess
+    (Process.proc "nix-env" ["--list-generations"])
+  Monad.return ()

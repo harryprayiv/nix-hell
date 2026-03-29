@@ -1,0 +1,6 @@
+#!/usr/bin/env nix-hell
+main = do
+  let services = ["sshd", "nginx", "postgresql"]
+  Monad.forM_ services \svc -> do
+    status <- Systemd.status svc
+    Text.putStrLn (svc <> ": " <> Text.take 60 status)

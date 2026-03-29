@@ -222,17 +222,35 @@ nix_flakeInputs dir = do
       case Map.lookup "nodes" (KeyMap.toMapText top) of
         Just (Json.Object nodes) ->
           Map.fromList
-            [ (k, url)
+            [ (k, describeLockedNode (KeyMap.toMapText locked))
             | (k, Json.Object node) <- Map.toList (KeyMap.toMapText nodes)
             , k /= "root"
             , Just (Json.Object locked) <-
                 [Map.lookup "locked" (KeyMap.toMapText node)]
-            , Just (Json.String url) <-
-                [Map.lookup "url" (KeyMap.toMapText locked)]
             ]
         _ -> Map.empty
     _ -> Map.empty
 
+describeLockedNode :: Map Text Json.Value -> Text
+describeLockedNode m =
+  case Map.lookup "type" m of
+    Just (Json.String "github") ->
+      let owner = strField "owner"
+          repo  = strField "repo"
+          rev   = Text.take 7 (strField "rev")
+      in "github:" <> owner <> "/" <> repo <> "/" <> rev
+    Just (Json.String "git") ->
+      strField "url" <> "@" <> Text.take 7 (strField "rev")
+    Just (Json.String "path") ->
+      strField "path"
+    Just (Json.String t) ->
+      t <> ":" <> strField "url"
+    _ -> "<unknown>"
+  where
+    strField k = case Map.lookup k m of
+      Just (Json.String v) -> v
+      _                    -> ""
+      
 --------------------------------------------------------------------------------
 -- Profile and GC
 

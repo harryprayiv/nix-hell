@@ -43,6 +43,7 @@
         devShells.default = haskellPackages.shellFor {
           packages = p: [ p.nix-hell ];
           buildInputs = [
+            wrappedBin
             pkgs.stack
             haskellPackages.cabal-install
             haskellPackages.haskell-language-server
