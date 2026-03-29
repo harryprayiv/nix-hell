@@ -41,7 +41,7 @@
 {-# OPTIONS_GHC -Wno-unused-foralls #-}
 
 module Main (main, specMain) where
-
+  
 #if __GLASGOW_HASKELL__ >= 906
 import Control.Monad
 #endif
@@ -1785,7 +1785,7 @@ supportedLits =
       -- Options
       lit' "Options.switch" Options.switch,
       lit' "Options.strOption" (Options.strOption @Text),
-      lit' "Options.strArgument" (Options.strArgument @Text)
+      lit' "Options.strArgument" (Options.strArgument @Text),
       -- StorePath
       lit' "StorePath.fromText"      NixHell.storePath_fromText,
       lit' "StorePath.toText"        NixHell.storePath_toText,

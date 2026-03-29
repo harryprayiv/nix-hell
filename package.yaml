@@ -44,6 +44,7 @@ library:
   source-dirs: src
   exposed-modules:
     - NixHell
+  other-modules: []
 
 executables:
   nix-hell:

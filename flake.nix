@@ -20,7 +20,9 @@
         ];
 
         overlay = final: prev: {
-          nix-hell = prev.callCabal2nix "nix-hell" ./. { };
+          nix-hell    = prev.callCabal2nix "nix-hell" ./. { };
+          microstache = pkgs.haskell.lib.doJailbreak prev.microstache;
+          criterion   = pkgs.haskell.lib.doJailbreak prev.criterion;
         };
 
         haskellPackages = pkgs.haskell.packages.ghc910.extend overlay;
@@ -40,10 +42,10 @@
 
         devShells.default = haskellPackages.shellFor {
           packages = p: [ p.nix-hell ];
-          buildInputs = with haskellPackages; [
-            stack
-            cabal-install
-            haskell-language-server
+          buildInputs = [
+            pkgs.stack
+            haskellPackages.cabal-install
+            haskellPackages.haskell-language-server
           ] ++ runtimeDeps;
         };
       }
