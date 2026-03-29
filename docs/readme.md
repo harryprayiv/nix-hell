@@ -20,4 +20,4 @@ Code coming shortly. Collaborators welcome.
 
 ## License
 
-Nix-Hell is a fork of [Hell](https://github.com/chrisdone/hell) by Chris Done, used under the BSD 3-Clause License. The original Hell source is copyright Chris Done. Modifications and additions comprising Nix-Hell are copyright Harry Pray IV. See [LICENSE](./LICENSE) for the full text.
+Nix-Hell is a fork of [Hell](https://github.com/chrisdone/hell) by Chris Done, used under the BSD 3-Clause License. The original Hell source is copyright Chris Done. Modifications and additions comprising Nix-Hell are copyright Harry Pray IV. See [LICENSE](.././LICENSE) for the full text.
