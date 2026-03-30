@@ -1,0 +1,121 @@
+#!/usr/bin/env nix-hell
+-- Runs all examples in sequence, reports pass/fail for each.
+-- Skip flags at the top let you exclude examples that need
+-- external prerequisites (sops files, age keys, sudo, NixOS-only).
+
+skipSops     = Bool.True   -- requires secrets/example.yaml
+skipAge      = Bool.True   -- requires test.pub / /tmp/test.key
+skipNixOS    = Bool.False  -- NixOS-only (generations, option, rollback)
+skipSudo     = Bool.True   -- requires privilege (systemd restart)
+skipSlow     = Bool.False  -- examples that call nix build
+
+main = do
+  args <- Environment.getArgs
+  let examplesDir = Maybe.maybe "examples" (\(d, rest) -> d) (List.uncons args)
+
+  results <- Monad.forM Main.examples \(num, name, skip, reason) ->
+    if skip
+      then do
+        Text.putStrLn ("[SKIP] " <> num <> " " <> name)
+        IO.pure (num, name, "skip")
+      else do
+        Text.putStr ("[RUN ] " <> num <> " " <> name <> " ... ")
+        (code, out, err) <- Text.readProcess
+          (Process.proc "nix-hell" [examplesDir <> "/" <> num <> "-" <> name <> ".hell"])
+        Exit.exitCode
+          (do Text.putStrLn "ok"
+              IO.pure (num, name, "pass"))
+          (\i -> do
+            Text.putStrLn ("FAIL (exit " <> Show.show i <> ")")
+            Monad.forM_ (List.take 5 (Text.lines err)) \line ->
+              Text.putStrLn ("       " <> line)
+            IO.pure (num, name, "fail"))
+          code
+
+  let passes = List.length $ List.filter (\(a,b,s) -> Eq.eq s "pass") results
+  let fails  = List.length $ List.filter (\(c,d,s) -> Eq.eq s "fail") results
+  let skips  = List.length $ List.filter (\(e,f,s) -> Eq.eq s "skip") results
+
+  Text.putStrLn ""
+  Text.putStrLn ("passed: " <> Show.show passes
+    <> "  failed: " <> Show.show fails
+    <> "  skipped: " <> Show.show skips)
+
+  if Ord.gt fails 0
+    then do
+      Text.putStrLn ""
+      Text.putStrLn "failures:"
+      Monad.forM_ results \(num, name, status) ->
+        if Eq.eq status "fail"
+          then Text.putStrLn ("  " <> num <> " " <> name)
+          else Monad.return ()
+      Exit.exitWith (Exit.ExitFailure fails)
+    else Text.putStrLn "all done"
+
+-- (number, name, skip, reason)
+examples =
+  [ ("01", "hello-world",         Bool.False, "")
+  , ("02", "interaction",         Bool.True,  "requires stdin")
+  , ("03", "press-any-key",       Bool.True,  "requires stdin")
+  , ("04", "writing-files",       Bool.False, "")
+  , ("05", "lists",               Bool.False, "")
+  , ("06", "polymorphism",        Bool.False, "")
+  , ("07", "loops",               Bool.True,  "requires stdin")
+  , ("08", "tuples",              Bool.False, "")
+  , ("09", "processes",           Bool.False, "")
+  , ("10", "current-directory",   Bool.False, "")
+  , ("11", "env-vars",            Bool.False, "")
+  , ("12", "fib",                 Bool.False, "")
+  , ("13", "concurrency",         Bool.True,  "requires external network")
+  , ("14", "text",                Bool.False, "")
+  , ("15", "type-classes",        Bool.False, "")
+  , ("16", "if",                  Bool.False, "")
+  , ("17", "reuse",               Bool.False, "")
+  , ("18", "monads",              Bool.False, "")
+  , ("19", "blog-generator",      Bool.True,  "requires pandoc + posts dir")
+  , ("20", "dollar",              Bool.False, "")
+  , ("21", "json",                Bool.False, "")
+  , ("22", "records",             Bool.False, "")
+  , ("23", "args",                Bool.False, "")
+  , ("24", "exitcode",            Bool.False, "")
+  , ("25", "sum-types",           Bool.False, "")
+  , ("26", "reference-other-types", Bool.False, "")
+  , ("27", "discussion-64",       Bool.False, "")
+  , ("28", "trees",               Bool.False, "")
+  , ("29", "temp-files",          Bool.False, "")
+  , ("30", "process-handlers",    Bool.False, "")
+  , ("31", "open-file-handle",    Bool.False, "")
+  , ("32", "optparse",            Bool.True,  "requires CLI args")
+  , ("33", "null-stream",         Bool.False, "")
+  , ("34", "field-puns",          Bool.False, "")
+  , ("35", "type-sigs",           Bool.False, "")
+  , ("36", "these",               Bool.False, "")
+  , ("37", "readshow",            Bool.False, "")
+  , ("38", "integer",             Bool.False, "")
+  , ("39", "day",                 Bool.False, "")
+  , ("40", "utctime",             Bool.False, "")
+  , ("41", "commands",            Bool.True,  "requires CLI args")
+  , ("42", "primcase",            Bool.False, "")
+  , ("43", "store-path-basics",   Main.skipSlow, "nix build")
+  , ("44", "nix-build",           Main.skipSlow, "nix build")
+  , ("45", "flake-info",          Bool.False, "")
+  , ("46", "secret-usage",        Main.skipSops, "requires sops file")
+  , ("47", "shell-safety",        Bool.False, "")
+  , ("48", "systemd-status",      Bool.False, "")
+  , ("49", "nixos-info",          Main.skipNixOS, "NixOS only")
+  , ("50", "age-roundtrip",       Main.skipAge,  "requires age keys")
+  , ("51", "gc-roots",            Main.skipSlow, "nix build")
+  , ("52", "nixhash",             Main.skipSlow, "nix build")
+  , ("53", "derivation",          Main.skipSlow, "nix build")
+  , ("54", "flake-type",          Bool.False, "")
+  , ("55", "profile-list",        Bool.False, "")
+  , ("56", "store-add-root",      Bool.False, "")
+  , ("57", "sops-getall",         Main.skipSops, "requires sops file")
+  , ("58", "nixos-generations",   Main.skipNixOS, "NixOS only")
+  , ("59", "systemd-manage",      Main.skipSudo, "requires sudo")
+  , ("60", "nixexpr",             Bool.False, "")
+  , ("61", "mkderivation",        Main.skipSlow, "nix build")
+  , ("62", "flake-graph",         Bool.False, "")
+  , ("63", "cache",               Main.skipSlow, "nix build")
+  , ("64", "flake-check",         Bool.False, "")
+  ]

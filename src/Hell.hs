@@ -836,6 +836,13 @@ instances =
         instance0 @Ord  @NixHell.Derivation,
         instance0 @Show @NixHell.Flake,
         instance0 @Eq   @NixHell.Flake,
+        -- Phase 2
+        instance0 @Show @NixHell.NixExpr,
+        instance0 @Eq   @NixHell.NixExpr,
+        instance0 @Show @NixHell.DerivationSpec,
+        instance0 @Eq   @NixHell.DerivationSpec,
+        instance0 @Show @NixHell.FlakeGraph,
+        instance0 @Eq   @NixHell.FlakeGraph,
         instance0 @Eq @Int,
         instance0 @Eq @Integer,
         instance0 @Eq @Day,
@@ -1612,7 +1619,11 @@ supportedTypeConstructors =
       ("Secret", SomeTypeRep $ typeRep @NixHell.Secret),
       ("NixHash", SomeTypeRep $ typeRep @NixHell.NixHash),
       ("Derivation", SomeTypeRep $ typeRep @NixHell.Derivation),
-      ("Flake", SomeTypeRep $ typeRep @NixHell.Flake)
+      ("Flake",       SomeTypeRep $ typeRep @NixHell.Flake),
+      -- Phase 2 additions
+      ("NixExpr",       SomeTypeRep $ typeRep @NixHell.NixExpr),
+      ("DerivationSpec", SomeTypeRep $ typeRep @NixHell.DerivationSpec),
+      ("FlakeGraph",    SomeTypeRep $ typeRep @NixHell.FlakeGraph)    
     ]
 
 -- | Used for constructors with no slot. E.g. True :: Nullary -> Bool
@@ -1860,7 +1871,36 @@ supportedLits =
       lit' "Flake.toText"            NixHell.flake_toText,
       -- Profile additions
       lit' "Nix.profileList"         NixHell.nix_profileList,
-      lit' "Nix.addRoot"             NixHell.nix_addRoot
+      lit' "Nix.addRoot"             NixHell.nix_addRoot,
+      -- Phase 2: NixExpr
+      lit' "NixExpr.str"             NixHell.nixExpr_str,
+      lit' "NixExpr.int"             NixHell.nixExpr_int,
+      lit' "NixExpr.bool"            NixHell.nixExpr_bool,
+      lit' "NixExpr.true"            NixHell.nixExpr_true,
+      lit' "NixExpr.false"           NixHell.nixExpr_false,
+      lit' "NixExpr.null"            NixHell.nixExpr_null,
+      lit' "NixExpr.list"            NixHell.nixExpr_list,
+      lit' "NixExpr.attrs"           NixHell.nixExpr_attrs,
+      lit' "NixExpr.path"            NixHell.nixExpr_path,
+      lit' "NixExpr.toText"          NixHell.nixExpr_toText,
+      lit' "NixExpr.eval"            NixHell.nixExpr_eval,
+      -- Phase 2: DerivationSpec
+      lit' "DerivationSpec.make"     NixHell.derivationSpec_make,
+      lit' "Nix.mkDerivation"        NixHell.nix_mkDerivation,
+      lit' "Nix.realise"             NixHell.nix_realise,
+      -- Phase 2: FlakeGraph
+      lit' "Nix.flakeGraph"          NixHell.nix_flakeGraph,
+      lit' "FlakeGraph.nodes"        NixHell.flakeGraph_nodes,
+      lit' "FlakeGraph.edges"        NixHell.flakeGraph_edges,
+      lit' "FlakeGraph.urls"         NixHell.flakeGraph_urls,
+      lit' "FlakeGraph.detectCycles" NixHell.flakeGraph_detectCycles,
+      -- Phase 2: Cache
+      lit' "Cache.get"               NixHell.cache_get,
+      lit' "Cache.set"               NixHell.cache_set,
+      lit' "Cache.getOrRun"          NixHell.cache_getOrRun,
+      lit' "Cache.invalidate"        NixHell.cache_invalidate,
+      -- Phase 2: flake check
+      lit' "Nix.checkFlakeOutputs"   NixHell.nix_checkFlakeOutputs
     ]
   where
     lit' :: forall a. (Type.Typeable a) => String -> a -> (String, (UTerm (), SomeTypeRep))

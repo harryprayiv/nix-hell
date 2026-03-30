@@ -1,0 +1,40 @@
+#!/usr/bin/env nix-hell
+-- NixExpr: build Nix expressions from Hell with type safety.
+-- The type checker prevents malformed Nix; you cannot accidentally
+-- produce a bare string where a path or int is needed.
+main = do
+  -- Atomic values
+  Text.putStrLn (NixExpr.toText (NixExpr.str "hello"))
+  Text.putStrLn (NixExpr.toText (NixExpr.int 42))
+  Text.putStrLn (NixExpr.toText NixExpr.true)
+  Text.putStrLn (NixExpr.toText NixExpr.null)
+
+  -- Composite values
+  let items = NixExpr.list [NixExpr.int 1, NixExpr.int 2, NixExpr.int 3]
+  Text.putStrLn (NixExpr.toText items)
+
+  let attrs = NixExpr.attrs
+        [ ("name",    NixExpr.str "nix-hell")
+        , ("version", NixExpr.str "1.0")
+        , ("stable",  NixExpr.true)
+        , ("count",   NixExpr.int 99)
+        ]
+  Text.putStrLn (NixExpr.toText attrs)
+
+  -- Special characters in strings are properly escaped
+  let tricky = NixExpr.str "path ${builtins.storePath} \"quoted\""
+  Text.putStrLn (NixExpr.toText tricky)
+
+  -- Evaluate a simple expression via nix eval
+  result <- NixExpr.eval (NixExpr.attrs
+    [ ("x", NixExpr.int 40)
+    , ("y", NixExpr.int 2)
+    ])
+  Text.putStrLn ("eval result: " <> Text.decodeUtf8 (Json.encode result))
+
+  -- Nested lists of attrsets
+  let matrix = NixExpr.list
+        [ NixExpr.attrs [("row", NixExpr.int 0), ("val", NixExpr.str "a")]
+        , NixExpr.attrs [("row", NixExpr.int 1), ("val", NixExpr.str "b")]
+        ]
+  Text.putStrLn (NixExpr.toText matrix)

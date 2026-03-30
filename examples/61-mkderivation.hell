@@ -1,0 +1,38 @@
+#!/usr/bin/env nix-hell
+-- DerivationSpec: construct a Nix derivation entirely from Hell.
+-- Builds a tiny derivation that writes a text file as its output.
+-- We request the .out output explicitly to avoid multi-output ambiguity.
+main = do
+  Text.putStrLn "fetching bash and coreutils..."
+  bash      <- Nix.build "nixpkgs#bash.out"
+  coreutils <- Nix.build "nixpkgs#coreutils.out"
+
+  let bashBinText = StorePath.toText bash <> "/bin/bash"
+  let coreBinText = StorePath.toText coreutils <> "/bin"
+
+  case StorePath.fromText bashBinText of
+    Maybe.Nothing ->
+      Exit.die ("unexpected bash path: " <> bashBinText)
+    Maybe.Just builder -> do
+      let spec = DerivationSpec.make
+            "hello-from-nix-hell"
+            builder
+            "x86_64-linux"
+            ["-c", "echo 'built by nix-hell' > $out"]
+            (Map.fromList [("PATH", coreBinText)])
+            []
+
+      Text.putStrLn "instantiating..."
+      drv <- Nix.mkDerivation spec
+      Text.putStrLn ("drv: " <> StorePath.toText (Derivation.toStorePath drv))
+
+      Text.putStrLn "realising..."
+      outputs <- Nix.realise drv
+      Monad.forM_ (Map.toList outputs) \(name, path) ->
+        Text.putStrLn (name <> " -> " <> StorePath.toText path)
+
+      case Map.lookup "out" outputs of
+        Maybe.Nothing      -> Exit.die "no out output"
+        Maybe.Just outPath -> do
+          contents <- Text.readFile (StorePath.toText outPath)
+          Text.putStrLn ("output contents: " <> Text.strip contents)

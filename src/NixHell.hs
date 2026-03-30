@@ -1,5 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 
 module NixHell
   ( -- Types
@@ -8,6 +10,9 @@ module NixHell
   , NixHash(..)
   , Derivation(..)
   , Flake(..)
+  , NixExpr(..)
+  , DerivationSpec(..)
+  , FlakeGraph(..)
     -- StorePath
   , storePath_fromText
   , storePath_toText
@@ -24,6 +29,33 @@ module NixHell
     -- Flake
   , flake_fromText
   , flake_toText
+    -- NixExpr
+  , nixExpr_str
+  , nixExpr_int
+  , nixExpr_bool
+  , nixExpr_true
+  , nixExpr_false
+  , nixExpr_null
+  , nixExpr_list
+  , nixExpr_attrs
+  , nixExpr_path
+  , nixExpr_toText
+  , nixExpr_eval
+    -- DerivationSpec
+  , derivationSpec_make
+  , nix_mkDerivation
+  , nix_realise
+    -- FlakeGraph
+  , nix_flakeGraph
+  , flakeGraph_nodes
+  , flakeGraph_edges
+  , flakeGraph_urls
+  , flakeGraph_detectCycles
+    -- Cache
+  , cache_get
+  , cache_set
+  , cache_getOrRun
+  , cache_invalidate
     -- Nix store
   , nix_build
   , nix_buildFlakeAttr
@@ -40,6 +72,7 @@ module NixHell
   , nix_flakeUpdate
   , nix_flakeLock
   , nix_flakeInputs
+  , nix_checkFlakeOutputs
     -- Profile and GC
   , nix_profileInstall
   , nix_profileRemove
@@ -85,6 +118,8 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import qualified System.Directory as Dir
+import System.Environment (getEnv)
 import qualified System.IO as IO
 import System.Process.Typed as Process
 import qualified System.IO.Temp as Temp
@@ -101,36 +136,70 @@ instance Show StorePath where
   show (StorePath t) = Text.unpack t
 
 -- | An opaque secret value. No Show instance: secrets cannot flow
--- into display, logging, or string concatenation. The only extraction
--- points are secret_toEnvValue and secret_writeFile.
+-- into display, logging, or string concatenation.
 newtype Secret = Secret Text
 
--- | A Nix content hash. Only constructible via hashing primitives,
--- never from raw strings. Uses Nix's own base32 SHA-256 format so
--- values are directly usable in derivation fixed-output hashes.
+-- | A Nix content hash in SRI format (sha256-<base64>). Only
+-- constructible via hashing primitives.
 newtype NixHash = NixHash Text
   deriving (Eq, Ord)
 
 instance Show NixHash where
   show (NixHash t) = Text.unpack t
 
--- | An unbuilt derivation (.drv path in the store). Distinct from
--- StorePath so the type checker can enforce that you do not pass a
--- built output where a derivation is expected.
+-- | An unbuilt derivation (.drv path). Distinct from StorePath so
+-- the type checker prevents confusing a derivation with a built output.
 newtype Derivation = Derivation StorePath
   deriving (Eq, Ord)
 
 instance Show Derivation where
   show (Derivation (StorePath t)) = Text.unpack t
 
--- | A validated flake reference. Opaque wrapper so the type checker
--- prevents accidentally passing a bare store path or arbitrary Text
--- where a flake ref is expected.
+-- | A validated flake reference.
 newtype Flake = Flake Text
   deriving (Eq)
 
 instance Show Flake where
   show (Flake t) = Text.unpack t
+
+-- | A typed Nix expression. Build with NixExpr.* constructors;
+-- serialize with NixExpr.toText; evaluate with NixExpr.eval.
+data NixExpr
+  = NixEStr  Text
+  | NixEInt  Int
+  | NixEBool Bool
+  | NixENull
+  | NixEList [NixExpr]
+  | NixEAttrs [(Text, NixExpr)]
+  | NixEPath StorePath
+  deriving (Eq)
+
+instance Show NixExpr where
+  show = Text.unpack . nixExpr_toText
+
+-- | Specification for a basic fixed derivation. Construct with
+-- DerivationSpec.make, then pass to Nix.mkDerivation.
+data DerivationSpec = DerivationSpec
+  { ds_name    :: Text
+  , ds_builder :: StorePath
+  , ds_system  :: Text
+  , ds_args    :: [Text]
+  , ds_env     :: Map Text Text
+  , ds_outputs :: [Text]
+  } deriving (Eq)
+
+instance Show DerivationSpec where
+  show ds = "DerivationSpec{name=" <> Text.unpack ds.ds_name <> "}"
+
+-- | A dependency graph of a flake's inputs, parsed from flake.lock.
+data FlakeGraph = FlakeGraph
+  { fg_nodes :: [Text]
+  , fg_edges :: [(Text, Text)]
+  , fg_urls  :: Map Text Text
+  } deriving (Eq)
+
+instance Show FlakeGraph where
+  show fg = "FlakeGraph{" <> show (length fg.fg_nodes) <> " nodes}"
 
 --------------------------------------------------------------------------------
 -- StorePath utilities
@@ -147,12 +216,9 @@ storePath_toText (StorePath t) = t
 --------------------------------------------------------------------------------
 -- Secret utilities
 
--- | The only way to extract a secret into plain Text. The verbose
--- name makes every extraction visible during code review.
 secret_toEnvValue :: Secret -> Text
 secret_toEnvValue (Secret t) = t
 
--- | Write a secret to a file with mode 600.
 secret_writeFile :: Text -> Secret -> IO ()
 secret_writeFile path (Secret t) = do
   ByteString.writeFile (Text.unpack path) (Text.encodeUtf8 t)
@@ -161,22 +227,18 @@ secret_writeFile path (Secret t) = do
 --------------------------------------------------------------------------------
 -- NixHash utilities
 
--- | Hash a Nix store path (file or directory) using the modern
--- 'nix hash path' command. Returns an SRI-format hash (sha256-...).
 nixHash_sha256Path :: StorePath -> IO NixHash
 nixHash_sha256Path (StorePath p) = do
   out <- readProcessStdout_
     (proc "nix" ["hash", "path", Text.unpack p])
   pure $ NixHash $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
 
--- | Hash arbitrary text content using Nix's own SHA-256 format.
 nixHash_sha256Text :: Text -> IO NixHash
 nixHash_sha256Text t =
   Temp.withSystemTempFile "nixhell-hash" $ \fp h -> do
     ByteString.hPutStr h (Text.encodeUtf8 t)
     IO.hClose h
-    out <- readProcessStdout_
-      (proc "nix" ["hash", "file", fp])
+    out <- readProcessStdout_ (proc "nix" ["hash", "file", fp])
     pure $ NixHash $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
 
 nixHash_toText :: NixHash -> Text
@@ -185,8 +247,6 @@ nixHash_toText (NixHash t) = t
 --------------------------------------------------------------------------------
 -- Derivation utilities
 
--- | Wrap a StorePath as a Derivation if it ends in ".drv".
--- Returns Nothing for any path that is not a derivation.
 derivation_fromStorePath :: StorePath -> Maybe Derivation
 derivation_fromStorePath sp@(StorePath t) =
   if Text.isSuffixOf ".drv" t
@@ -199,9 +259,6 @@ derivation_toStorePath (Derivation sp) = sp
 --------------------------------------------------------------------------------
 -- Flake utilities
 
--- | Construct a Flake reference from Text. Returns Nothing for
--- obviously invalid references (empty, whitespace only). Full
--- validation is left to Nix itself at evaluation time.
 flake_fromText :: Text -> Maybe Flake
 flake_fromText t
   | Text.null (Text.strip t) = Nothing
@@ -211,13 +268,277 @@ flake_toText :: Flake -> Text
 flake_toText (Flake t) = t
 
 --------------------------------------------------------------------------------
+-- NixExpr construction
+
+nixExpr_str :: Text -> NixExpr
+nixExpr_str = NixEStr
+
+nixExpr_int :: Int -> NixExpr
+nixExpr_int = NixEInt
+
+nixExpr_bool :: Bool -> NixExpr
+nixExpr_bool = NixEBool
+
+nixExpr_true :: NixExpr
+nixExpr_true = NixEBool True
+
+nixExpr_false :: NixExpr
+nixExpr_false = NixEBool False
+
+nixExpr_null :: NixExpr
+nixExpr_null = NixENull
+
+nixExpr_list :: [NixExpr] -> NixExpr
+nixExpr_list = NixEList
+
+nixExpr_attrs :: [(Text, NixExpr)] -> NixExpr
+nixExpr_attrs = NixEAttrs
+
+nixExpr_path :: StorePath -> NixExpr
+nixExpr_path = NixEPath
+
+-- | Serialize a NixExpr to valid Nix language text.
+nixExpr_toText :: NixExpr -> Text
+nixExpr_toText = go
+  where
+    go = \case
+      NixEStr t              -> "\"" <> escStr t <> "\""
+      NixEInt i              -> Text.pack (show i)
+      NixEBool True          -> "true"
+      NixEBool False         -> "false"
+      NixENull               -> "null"
+      NixEPath (StorePath p) -> p
+      NixEList xs            -> "[ " <> Text.unwords (map go xs) <> " ]"
+      NixEAttrs kvs          -> "{ " <> Text.concat (map renderAttr kvs) <> "}"
+    renderAttr (k, v) = k <> " = " <> go v <> "; "
+    escStr t =
+      Text.replace "${" "\\${"
+      $ Text.replace "\"" "\\\""
+      $ Text.replace "\\" "\\\\" t
+
+-- | Evaluate a NixExpr and return the result as a JSON Value.
+nixExpr_eval :: NixExpr -> IO Value
+nixExpr_eval expr = do
+  out <- readProcessStdout_
+    (proc "nix" ["eval", "--json", "--expr", Text.unpack (nixExpr_toText expr)])
+  case Json.decode out of
+    Nothing -> error "NixExpr.eval: nix returned invalid JSON"
+    Just v  -> pure v
+
+--------------------------------------------------------------------------------
+-- DerivationSpec
+
+derivationSpec_make ::
+  Text -> StorePath -> Text -> [Text] -> Map Text Text -> [Text] ->
+  DerivationSpec
+derivationSpec_make name builder system args env outputs =
+  DerivationSpec
+    { ds_name    = name
+    , ds_builder = builder
+    , ds_system  = system
+    , ds_args    = args
+    , ds_env     = env
+    , ds_outputs = outputs
+    }
+
+-- | Instantiate a DerivationSpec to a .drv file without building it.
+nix_mkDerivation :: DerivationSpec -> IO Derivation
+nix_mkDerivation ds = do
+  let expr = derivationSpecToNix ds
+  out <- readProcessStdout_
+    (proc "nix-instantiate" ["--expr", Text.unpack expr])
+  let t = Text.strip $ Text.decodeUtf8 $ L.toStrict out
+  case derivation_fromStorePath (StorePath t) of
+    Just drv -> pure drv
+    Nothing  ->
+      error $ "Nix.mkDerivation: result is not a .drv path: " <> Text.unpack t
+
+-- | Build a derivation, returning its output store paths keyed by output name.
+nix_realise :: Derivation -> IO (Map Text StorePath)
+nix_realise drv = do
+  out <- readProcessStdout_
+    (proc "nix-store"
+      ["--realise", Text.unpack (storePath_toText (derivation_toStorePath drv))])
+  let paths = filter (not . Text.null)
+            $ Text.lines
+            $ Text.decodeUtf8
+            $ L.toStrict out
+  case paths of
+    [p] -> pure $ Map.singleton "out" (StorePath p)
+    ps  -> pure $ Map.fromList
+             $ zip (map (\i -> "out" <> Text.pack (show (i :: Int))) [0..])
+                   (map StorePath ps)
+
+-- | Internal: convert a DerivationSpec to a Nix derivation expression.
+--
+-- The builder StorePath is split into base (/nix/store/hash-name) and
+-- subpath (/bin/bash). builtins.storePath on the base registers it as a
+-- proper derivation input so the build sandbox can access it. A bare
+-- string would not be added to inputSrcs and the binary would be missing
+-- inside the sandbox despite the path being syntactically correct.
+derivationSpecToNix :: DerivationSpec -> Text
+derivationSpecToNix ds =
+  "let __builder = builtins.storePath "
+  <> nixStr storeBase
+  <> "; in derivation { "
+  <> Text.unwords fields
+  <> " }"
+  where
+    builderText = storePath_toText ds.ds_builder
+    storeBase   = Text.intercalate "/" (take 4 (Text.splitOn "/" builderText))
+    subPath     = Text.drop (Text.length storeBase) builderText
+    builderExpr =
+      if Text.null subPath
+        then "__builder"
+        else "__builder + " <> nixStr subPath
+    fields =
+      [ "name = "    <> nixStr ds.ds_name <> ";"
+      , "builder = " <> builderExpr <> ";"
+      , "system = "  <> nixStr ds.ds_system <> ";"
+      ]
+      ++ (if null ds.ds_args then []
+          else ["args = [ " <> Text.unwords (map nixStr ds.ds_args) <> " ];"])
+      ++ (if null ds.ds_outputs then []
+          else ["outputs = [ " <> Text.unwords (map nixStr ds.ds_outputs) <> " ];"])
+      ++ [ k <> " = " <> nixStr v <> ";"
+         | (k, v) <- Map.toList ds.ds_env ]
+    nixStr t =
+      "\"" <> Text.replace "\\" "\\\\" (Text.replace "\"" "\\\"" t) <> "\""
+
+--------------------------------------------------------------------------------
+-- FlakeGraph analysis
+
+nix_flakeGraph :: Text -> IO FlakeGraph
+nix_flakeGraph dir = do
+  v <- nix_flakeLock dir
+  pure $ case v of
+    Json.Object top ->
+      case Map.lookup "nodes" (KeyMap.toMapText top) of
+        Just (Json.Object nodes) ->
+          let nodeMap  = KeyMap.toMapText nodes
+              allNodes = filter (/= "root") $ Map.keys nodeMap
+              edges =
+                [ (parent, child)
+                | (parent, Json.Object node) <- Map.toList nodeMap
+                , parent /= "root"
+                , Just (Json.Object inputs) <-
+                    [Map.lookup "inputs" (KeyMap.toMapText node)]
+                , (_, Json.String child) <-
+                    Map.toList (KeyMap.toMapText inputs)
+                ]
+              urls = Map.fromList
+                [ (k, describeLockedNode (KeyMap.toMapText locked))
+                | (k, Json.Object node) <- Map.toList nodeMap
+                , k /= "root"
+                , Just (Json.Object locked) <-
+                    [Map.lookup "locked" (KeyMap.toMapText node)]
+                ]
+          in FlakeGraph { fg_nodes = allNodes, fg_edges = edges, fg_urls = urls }
+        _ -> FlakeGraph { fg_nodes = [], fg_edges = [], fg_urls = Map.empty }
+    _ -> FlakeGraph { fg_nodes = [], fg_edges = [], fg_urls = Map.empty }
+
+flakeGraph_nodes :: FlakeGraph -> [Text]
+flakeGraph_nodes = fg_nodes
+
+flakeGraph_edges :: FlakeGraph -> [(Text, Text)]
+flakeGraph_edges = fg_edges
+
+flakeGraph_urls :: FlakeGraph -> Map Text Text
+flakeGraph_urls = fg_urls
+
+flakeGraph_detectCycles :: FlakeGraph -> Maybe [Text]
+flakeGraph_detectCycles fg =
+  foldl
+    (\acc node -> case acc of
+      Just c  -> Just c
+      Nothing -> dfs [] node)
+    Nothing
+    (fg_nodes fg)
+  where
+    adjacency :: Map Text [Text]
+    adjacency = Map.fromListWith (++)
+      [ (from, [to]) | (from, to) <- fg_edges fg ]
+
+    neighbours :: Text -> [Text]
+    neighbours node = case Map.lookup node adjacency of
+      Nothing -> []
+      Just ns -> ns
+
+    dfs :: [Text] -> Text -> Maybe [Text]
+    dfs stack node
+      | node `elem` stack =
+          Just (dropWhile (/= node) stack ++ [node])
+      | otherwise =
+          foldl
+            (\acc child -> case acc of
+              Just c  -> Just c
+              Nothing -> dfs (stack ++ [node]) child)
+            Nothing
+            (neighbours node)
+
+--------------------------------------------------------------------------------
+-- Cache: persistent KV store in ~/.cache/nix-hell/
+
+cacheDir :: IO FilePath
+cacheDir = do
+  home <- getEnv "HOME"
+  let dir = home <> "/.cache/nix-hell"
+  Dir.createDirectoryIfMissing True dir
+  pure dir
+
+sanitizeKey :: Text -> String
+sanitizeKey = Text.unpack . Text.map safeChar
+  where
+    safeChar '/' = '_'
+    safeChar ':' = '_'
+    safeChar c   = c
+
+cache_get :: Text -> IO (Maybe Text)
+cache_get key = do
+  dir <- cacheDir
+  let fp = dir <> "/" <> sanitizeKey key
+  exists <- Dir.doesFileExist fp
+  if exists
+    then fmap (Just . Text.decodeUtf8) (ByteString.readFile fp)
+    else pure Nothing
+
+cache_set :: Text -> Text -> IO ()
+cache_set key val = do
+  dir <- cacheDir
+  let fp = dir <> "/" <> sanitizeKey key
+  ByteString.writeFile fp (Text.encodeUtf8 val)
+
+cache_getOrRun :: Text -> IO Text -> IO Text
+cache_getOrRun key action = do
+  mval <- cache_get key
+  case mval of
+    Just v  -> pure v
+    Nothing -> do
+      v <- action
+      cache_set key v
+      pure v
+
+cache_invalidate :: Text -> IO ()
+cache_invalidate key = do
+  dir <- cacheDir
+  let fp = dir <> "/" <> sanitizeKey key
+  exists <- Dir.doesFileExist fp
+  if exists then Dir.removeFile fp else pure ()
+
+--------------------------------------------------------------------------------
 -- Nix store operations
 
 nix_build :: Text -> IO StorePath
 nix_build attr = do
   out <- readProcessStdout_
     (proc "nix" ["build", "--no-link", "--print-out-paths", Text.unpack attr])
-  pure $ StorePath $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
+  let paths = filter (not . Text.null)
+            $ Text.lines
+            $ Text.decodeUtf8
+            $ L.toStrict out
+  case paths of
+    (p:_) -> pure $ StorePath p
+    []    -> error $ "Nix.build: no output paths for " <> Text.unpack attr
 
 nix_buildFlakeAttr :: Text -> Text -> IO StorePath
 nix_buildFlakeAttr flake attr =
@@ -239,7 +560,6 @@ nix_evalFlakeAttr flake attr = do
     Nothing -> error "Nix.evalFlakeAttr: nix returned invalid JSON"
     Just v  -> pure v
 
--- | Instantiate a Nix expression to a derivation (.drv) path.
 nix_instantiate :: Text -> IO Derivation
 nix_instantiate expr = do
   out <- readProcessStdout_
@@ -247,8 +567,8 @@ nix_instantiate expr = do
   let t = Text.strip $ Text.decodeUtf8 $ L.toStrict out
   case derivation_fromStorePath (StorePath t) of
     Just drv -> pure drv
-    Nothing  -> error $ "Nix.instantiate: result is not a .drv path: "
-                     <> Text.unpack t
+    Nothing  ->
+      error $ "Nix.instantiate: result is not a .drv path: " <> Text.unpack t
 
 nix_storeAdd :: Text -> ByteString -> IO StorePath
 nix_storeAdd name contents =
@@ -329,14 +649,20 @@ nix_flakeInputs dir = do
         _ -> Map.empty
     _ -> Map.empty
 
+nix_checkFlakeOutputs :: Text -> IO (Either Text Text)
+nix_checkFlakeOutputs dir = do
+  (code, _out, err) <- readProcess
+    (proc "nix" ["flake", "check", Text.unpack dir])
+  pure $ case code of
+    ExitSuccess   -> Right "flake check passed"
+    ExitFailure _ -> Left (Text.decodeUtf8 (L.toStrict err))
+
 describeLockedNode :: Map Text Json.Value -> Text
 describeLockedNode m =
   case Map.lookup "type" m of
     Just (Json.String "github") ->
-      let owner = strField "owner"
-          repo  = strField "repo"
-          rev   = Text.take 7 (strField "rev")
-      in "github:" <> owner <> "/" <> repo <> "/" <> rev
+      "github:" <> strField "owner" <> "/" <> strField "repo"
+                <> "/" <> Text.take 7 (strField "rev")
     Just (Json.String "git") ->
       strField "url" <> "@" <> Text.take 7 (strField "rev")
     Just (Json.String "path") ->
@@ -360,18 +686,14 @@ nix_profileRemove :: Text -> IO ()
 nix_profileRemove name =
   runProcess_ (proc "nix" ["profile", "remove", Text.unpack name])
 
--- | List all store paths currently installed in the default profile.
 nix_profileList :: IO [StorePath]
 nix_profileList = do
-  out <- readProcessStdout_
-    (proc "nix" ["profile", "list", "--json"])
+  out <- readProcessStdout_ (proc "nix" ["profile", "list", "--json"])
   case Json.decode out of
     Just (Json.Object top) ->
       case Map.lookup "elements" (KeyMap.toMapText top) of
         Just (Json.Array elems) ->
-          pure
-            $ concatMap extractStorePaths
-            $ foldr (:) [] elems
+          pure $ concatMap extractStorePaths $ foldr (:) [] elems
         _ -> pure []
     _ -> pure []
   where
@@ -379,9 +701,7 @@ nix_profileList = do
     extractStorePaths (Json.Object m) =
       case Map.lookup "storePaths" (KeyMap.toMapText m) of
         Just (Json.Array paths) ->
-          [ StorePath t
-          | Json.String t <- foldr (:) [] paths
-          ]
+          [ StorePath t | Json.String t <- foldr (:) [] paths ]
         _ -> []
     extractStorePaths _ = []
 
@@ -401,8 +721,6 @@ nix_gcRoots = do
     takeLeft (x:_) = x
     takeLeft []    = ""
 
--- | Register a GC root, preventing the given store path from being
--- collected. The root link is created at the given filesystem path.
 nix_addRoot :: StorePath -> Text -> IO ()
 nix_addRoot (StorePath p) rootPath =
   runProcess_
@@ -414,7 +732,7 @@ nix_optimiseStore :: IO ()
 nix_optimiseStore = runProcess_ (proc "nix" ["store", "optimise"])
 
 --------------------------------------------------------------------------------
--- Secret operations
+-- Sops operations
 
 sops_get :: Text -> Text -> IO Secret
 sops_get file key = do
@@ -461,8 +779,7 @@ age_decrypt identityFile ciphertext = do
       (byteStringInput (L.fromStrict ciphertext))
       (proc "age" ["--decrypt", "--identity", Text.unpack identityFile]))
   case code of
-    ExitSuccess   ->
-      pure $ Secret $ Text.decodeUtf8 $ L.toStrict out
+    ExitSuccess   -> pure $ Secret $ Text.decodeUtf8 $ L.toStrict out
     ExitFailure _ ->
       error $ "Age.decrypt failed: "
            <> Text.unpack (Text.decodeUtf8 (L.toStrict err))
@@ -509,20 +826,31 @@ nixos_currentSystem = do
   out <- readProcessStdout_ (proc "readlink" ["-f", "/run/current-system"])
   pure $ StorePath $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
 
+-- | Evaluate a NixOS option via the flake-based system configuration.
+-- Reads the hostname to select the right nixosConfigurations entry,
+-- then calls nix eval --json on the resulting attribute path.
 nixos_option :: Text -> IO Value
 nixos_option option = do
+  hostname <- fmap (Text.strip . Text.decodeUtf8 . L.toStrict)
+                (readProcessStdout_ (proc "hostname" []))
+  let expr = Text.unpack $ Text.concat
+               [ "(builtins.getFlake \"/etc/nixos\")"
+               , ".nixosConfigurations."
+               , hostname
+               , ".config."
+               , option
+               ]
   out <- readProcessStdout_
-    (proc "nixos-option" ["--json", Text.unpack option])
+    (proc "nix" ["eval", "--json", "--impure", "--expr", expr])
   case Json.decode out of
-    Nothing -> error "NixOS.option: invalid JSON"
+    Nothing -> error $ "NixOS.option: invalid JSON for " <> Text.unpack option
     Just v  -> pure v
 
 nixos_generations :: IO Text
 nixos_generations = do
-  out <- readProcessStdout_
-    (proc "nix-env"
-      ["--list-generations", "--profile", "/nix/var/nix/profiles/system"])
-  pure $ Text.decodeUtf8 $ L.toStrict out
+  entries <- Dir.listDirectory "/nix/var/nix/profiles"
+  let gens = filter (Text.isPrefixOf "system-" . Text.pack) entries
+  pure $ Text.unlines $ map Text.pack $ foldr (:) [] gens
 
 nixos_rollback :: IO ()
 nixos_rollback =

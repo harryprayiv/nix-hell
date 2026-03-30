@@ -1,0 +1,28 @@
+#!/usr/bin/env nix-hell
+-- FlakeGraph: parse a flake's input dependency graph and run
+-- static analysis on it. Useful for auditing complex flakes.
+main = do
+  graph <- Nix.flakeGraph "."
+
+  let nodes = FlakeGraph.nodes graph
+  let edges = FlakeGraph.edges graph
+  let urls  = FlakeGraph.urls graph
+
+  Text.putStrLn ("nodes (" <> Show.show (List.length nodes) <> "):")
+  Monad.forM_ nodes \n ->
+    case Map.lookup n urls of
+      Maybe.Nothing -> Text.putStrLn ("  " <> n)
+      Maybe.Just u  -> Text.putStrLn ("  " <> n <> " -> " <> u)
+
+  if List.null edges
+    then Text.putStrLn "no inter-input edges"
+    else do
+      Text.putStrLn ("edges (" <> Show.show (List.length edges) <> "):")
+      Monad.forM_ edges \(from, to) ->
+        Text.putStrLn ("  " <> from <> " -> " <> to)
+
+  case FlakeGraph.detectCycles graph of
+    Maybe.Nothing ->
+      Text.putStrLn "no cycles detected (expected)"
+    Maybe.Just cycle ->
+      Text.putStrLn ("CYCLE FOUND: " <> Text.intercalate " -> " cycle)

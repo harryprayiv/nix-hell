@@ -1,0 +1,24 @@
+#!/usr/bin/env nix-hell
+-- Cache: avoid re-running expensive operations across script invocations.
+-- The cache persists in ~/.cache/nix-hell/ between runs.
+main = do
+  -- First call runs the action and caches. Subsequent runs hit the cache.
+  Text.putStrLn "computing (or loading from cache)..."
+  result <- Cache.getOrRun "nixpkgs-hello-path" do
+    path <- Nix.build "nixpkgs#hello"
+    IO.pure (StorePath.toText path)
+  Text.putStrLn ("hello path: " <> result)
+
+  -- Demonstrate explicit get/set.
+  Cache.set "my-timestamp" "2026-03-30"
+  cached <- Cache.get "my-timestamp"
+  case cached of
+    Maybe.Nothing   -> Text.putStrLn "miss (unexpected)"
+    Maybe.Just val  -> Text.putStrLn ("cached timestamp: " <> val)
+
+  -- Invalidate and verify the entry is gone.
+  Cache.invalidate "my-timestamp"
+  after <- Cache.get "my-timestamp"
+  case after of
+    Maybe.Nothing    -> Text.putStrLn "PASS: invalidation worked"
+    Maybe.Just stale -> Exit.die ("FAIL: entry still present: " <> stale)

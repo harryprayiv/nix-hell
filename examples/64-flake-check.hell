@@ -1,0 +1,14 @@
+#!/usr/bin/env nix-hell
+-- nix_checkFlakeOutputs: run nix flake check on a directory and
+-- report results. Returns Right on success, Left with error on failure.
+main = do
+  Text.putStrLn "checking flake outputs..."
+  result <- Nix.checkFlakeOutputs "."
+  case result of
+    Either.Right msg ->
+      Text.putStrLn ("ok: " <> msg)
+    Either.Left err -> do
+      Text.putStrLn "flake check failed:"
+      Monad.forM_ (Text.lines err) \line ->
+        Text.putStrLn ("  " <> line)
+      Exit.die "aborting"
