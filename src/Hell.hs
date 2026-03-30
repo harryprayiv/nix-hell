@@ -828,6 +828,14 @@ instances =
         instance0 @Show @NixHell.StorePath,
         instance0 @Eq   @NixHell.StorePath,
         instance0 @Ord  @NixHell.StorePath,
+        instance0 @Show @NixHell.NixHash,
+        instance0 @Eq   @NixHell.NixHash,
+        instance0 @Ord  @NixHell.NixHash,
+        instance0 @Show @NixHell.Derivation,
+        instance0 @Eq   @NixHell.Derivation,
+        instance0 @Ord  @NixHell.Derivation,
+        instance0 @Show @NixHell.Flake,
+        instance0 @Eq   @NixHell.Flake,
         instance0 @Eq @Int,
         instance0 @Eq @Integer,
         instance0 @Eq @Day,
@@ -1601,7 +1609,10 @@ supportedTypeConstructors =
       ("hell:Hell.Tagged", SomeTypeRep $ typeRep @Tagged),
       ("hell:Hell.Nullary", SomeTypeRep $ typeRep @Nullary),
       ("StorePath", SomeTypeRep $ typeRep @NixHell.StorePath),
-      ("Secret",    SomeTypeRep $ typeRep @NixHell.Secret)
+      ("Secret", SomeTypeRep $ typeRep @NixHell.Secret),
+      ("NixHash", SomeTypeRep $ typeRep @NixHell.NixHash),
+      ("Derivation", SomeTypeRep $ typeRep @NixHell.Derivation),
+      ("Flake", SomeTypeRep $ typeRep @NixHell.Flake)
     ]
 
 -- | Used for constructors with no slot. E.g. True :: Nullary -> Bool
@@ -1836,7 +1847,20 @@ supportedLits =
       lit' "Systemd.start"           NixHell.systemd_start,
       lit' "Systemd.stop"            NixHell.systemd_stop,
       lit' "Systemd.restart"         NixHell.systemd_restart,
-      lit' "Systemd.logs"            NixHell.systemd_logs
+      lit' "Systemd.logs"            NixHell.systemd_logs,
+      -- NixHash
+      lit' "NixHash.sha256File"      NixHell.nixHash_sha256File,
+      lit' "NixHash.sha256Text"      NixHell.nixHash_sha256Text,
+      lit' "NixHash.toText"          NixHell.nixHash_toText,
+      -- Derivation
+      lit' "Derivation.fromStorePath" NixHell.derivation_fromStorePath,
+      lit' "Derivation.toStorePath"   NixHell.derivation_toStorePath,
+      -- Flake
+      lit' "Flake.fromText"          NixHell.flake_fromText,
+      lit' "Flake.toText"            NixHell.flake_toText,
+      -- Profile additions
+      lit' "Nix.profileList"         NixHell.nix_profileList,
+      lit' "Nix.addRoot"             NixHell.nix_addRoot
     ]
   where
     lit' :: forall a. (Type.Typeable a) => String -> a -> (String, (UTerm (), SomeTypeRep))
