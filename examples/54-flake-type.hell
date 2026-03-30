@@ -1,0 +1,24 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates the Flake opaque type. It prevents raw strings
+-- or store paths from being passed where a flake ref is expected.
+main = do
+  case Flake.fromText "nixpkgs" of
+    Maybe.Nothing -> Exit.die "FAIL: nixpkgs rejected"
+    Maybe.Just f  -> Text.putStrLn ("flake ref: " <> Flake.toText f)
+
+  case Flake.fromText "github:NixOS/nixpkgs/nixos-24.05" of
+    Maybe.Nothing -> Exit.die "FAIL: github ref rejected"
+    Maybe.Just f  -> Text.putStrLn ("github ref: " <> Flake.toText f)
+
+  case Flake.fromText "." of
+    Maybe.Nothing -> Exit.die "FAIL: path ref rejected"
+    Maybe.Just f  -> Text.putStrLn ("path ref: " <> Flake.toText f)
+
+  -- Empty or whitespace-only strings are rejected.
+  case Flake.fromText "" of
+    Maybe.Nothing    -> Text.putStrLn "PASS: empty string rejected"
+    Maybe.Just empty -> Exit.die ("FAIL: empty string accepted as: " <> Flake.toText empty)
+
+  case Flake.fromText "   " of
+    Maybe.Nothing       -> Text.putStrLn "PASS: whitespace rejected"
+    Maybe.Just spaces   -> Exit.die ("FAIL: whitespace accepted as: " <> Flake.toText spaces)

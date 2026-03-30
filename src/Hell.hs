@@ -1849,7 +1849,7 @@ supportedLits =
       lit' "Systemd.restart"         NixHell.systemd_restart,
       lit' "Systemd.logs"            NixHell.systemd_logs,
       -- NixHash
-      lit' "NixHash.sha256File"      NixHell.nixHash_sha256File,
+      lit' "NixHash.sha256Path"      NixHell.nixHash_sha256Path,
       lit' "NixHash.sha256Text"      NixHell.nixHash_sha256Text,
       lit' "NixHash.toText"          NixHell.nixHash_toText,
       -- Derivation

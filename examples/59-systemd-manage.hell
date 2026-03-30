@@ -1,0 +1,25 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates Systemd start/stop/restart/logs beyond just status.
+-- Uses a harmless transient service so nothing real is affected.
+-- Requires systemd and sudo-less access to systemctl --user,
+-- or adjust to a real unit name you have permission to manage.
+main = do
+  let unit = "sshd"
+
+  Text.putStrLn ("--- status of " <> unit <> " ---")
+  status <- Systemd.status unit
+  Text.putStrLn (Text.take 200 status)
+
+  Text.putStrLn ("--- last 20 log lines of " <> unit <> " ---")
+  logs <- Systemd.logs unit
+  let lastLines = List.take 20 $ List.reverse $ Text.lines logs
+  Monad.forM_ (List.reverse lastLines) Text.putStrLn
+
+  -- Restart and check the exit code rather than using runProcess_
+  -- so we can handle a non-zero exit without dying.
+  Text.putStrLn ("--- restarting " <> unit <> " ---")
+  code <- Systemd.restart unit
+  Exit.exitCode
+    (Text.putStrLn "restart succeeded")
+    (\i -> Text.putStrLn ("restart exited with: " <> Show.show i))
+    code

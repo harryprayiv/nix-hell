@@ -1,0 +1,18 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates NixOS.generations and NixOS.option.
+-- Safe to run on any NixOS machine; does not modify the system.
+main = do
+  -- List system generations.
+  gens <- NixOS.generations
+  Text.putStrLn "system generations:"
+  Monad.forM_ (Text.lines gens) \line ->
+    if Eq.eq (Text.strip line) ""
+      then Monad.return ()
+      else Text.putStrLn ("  " <> line)
+
+  -- Query a NixOS option value as JSON.
+  networking <- NixOS.option "networking.hostName"
+  Text.putStrLn ("networking.hostName: " <> Text.decodeUtf8 (Json.encode networking))
+
+  sys <- NixOS.currentSystem
+  Text.putStrLn ("current system: " <> StorePath.toText sys)

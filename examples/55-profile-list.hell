@@ -1,0 +1,8 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates profileList: enumerate what is currently installed
+-- in the default Nix profile. Safe to run; does not modify anything.
+main = do
+  paths <- Nix.profileList
+  Text.putStrLn ("installed in default profile: " <> Show.show (List.length paths))
+  Monad.forM_ paths \p ->
+    Text.putStrLn ("  " <> StorePath.toText p)

@@ -1,0 +1,17 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates NixHash: the only way to produce a hash value is
+-- through a hashing primitive. Raw Text cannot be coerced to NixHash.
+-- NixHash.sha256Path works on any store path (file or directory).
+main = do
+  path <- Nix.build "nixpkgs#hello"
+  hash <- NixHash.sha256Path path
+  Text.putStrLn ("sha256 of hello: " <> NixHash.toText hash)
+
+  hash2 <- NixHash.sha256Text "hello, nix-hell"
+  Text.putStrLn ("sha256 of text:  " <> NixHash.toText hash2)
+
+  -- Hashing the same content twice must produce identical results.
+  hash3 <- NixHash.sha256Text "hello, nix-hell"
+  if Eq.eq hash2 hash3
+    then Text.putStrLn "PASS: identical content produces identical hash"
+    else Exit.die "FAIL: hash is not deterministic"

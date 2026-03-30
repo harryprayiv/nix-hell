@@ -1,0 +1,21 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates Derivation as a distinct type from StorePath.
+-- nix_instantiate returns IO Derivation, not IO StorePath,
+-- so the type checker prevents passing a .drv path where a
+-- built output is expected and vice-versa.
+main = do
+  drv <- Nix.instantiate "(import <nixpkgs> {}).hello"
+  Text.putStrLn ("derivation path: " <> StorePath.toText (Derivation.toStorePath drv))
+
+  -- Round-trip: a .drv StorePath can be wrapped back into a Derivation.
+  let sp = Derivation.toStorePath drv
+  case Derivation.fromStorePath sp of
+    Maybe.Nothing   -> Exit.die "FAIL: lost .drv suffix"
+    Maybe.Just drv2 ->
+      Text.putStrLn ("round-trip ok: " <> StorePath.toText (Derivation.toStorePath drv2))
+
+  -- fromStorePath must reject non-.drv paths.
+  path <- Nix.build "nixpkgs#hello"
+  case Derivation.fromStorePath path of
+    Maybe.Nothing        -> Text.putStrLn "PASS: built output correctly rejected as Derivation"
+    Maybe.Just wrongDrv  -> Exit.die ("FAIL: built output accepted as Derivation: " <> StorePath.toText (Derivation.toStorePath wrongDrv))

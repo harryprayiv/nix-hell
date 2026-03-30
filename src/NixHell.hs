@@ -15,7 +15,7 @@ module NixHell
   , secret_toEnvValue
   , secret_writeFile
     -- NixHash
-  , nixHash_sha256File
+  , nixHash_sha256Path
   , nixHash_sha256Text
   , nixHash_toText
     -- Derivation
@@ -161,12 +161,12 @@ secret_writeFile path (Secret t) = do
 --------------------------------------------------------------------------------
 -- NixHash utilities
 
--- | Hash a store path using Nix's own SHA-256 format.
--- The result is in Nix base32, directly usable as a fixed-output hash.
-nixHash_sha256File :: StorePath -> IO NixHash
-nixHash_sha256File (StorePath p) = do
+-- | Hash a Nix store path (file or directory) using the modern
+-- 'nix hash path' command. Returns an SRI-format hash (sha256-...).
+nixHash_sha256Path :: StorePath -> IO NixHash
+nixHash_sha256Path (StorePath p) = do
   out <- readProcessStdout_
-    (proc "nix-hash" ["--type", "sha256", "--flat", Text.unpack p])
+    (proc "nix" ["hash", "path", Text.unpack p])
   pure $ NixHash $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
 
 -- | Hash arbitrary text content using Nix's own SHA-256 format.
@@ -176,7 +176,7 @@ nixHash_sha256Text t =
     ByteString.hPutStr h (Text.encodeUtf8 t)
     IO.hClose h
     out <- readProcessStdout_
-      (proc "nix-hash" ["--type", "sha256", "--flat", fp])
+      (proc "nix" ["hash", "file", fp])
     pure $ NixHash $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
 
 nixHash_toText :: NixHash -> Text

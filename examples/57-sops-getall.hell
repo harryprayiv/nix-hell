@@ -1,0 +1,24 @@
+#!/usr/bin/env nix-hell
+-- Demonstrates Sops.getAll: decrypt an entire sops file and
+-- work with multiple secrets at once.
+--
+-- Requires a sops-encrypted file at secrets/example.yaml.
+-- The Secret type has no Show instance, so individual values
+-- cannot be printed directly; they can only be passed to
+-- secret_toEnvValue or secret_writeFile.
+main = do
+  secrets <- Sops.getAll "secrets/example.yaml"
+  let keys = Map.keys secrets
+  Text.putStrLn ("loaded " <> Show.show (Map.size secrets) <> " secrets")
+  Text.putStrLn ("keys: " <> Text.intercalate ", " keys)
+
+  -- Use a specific secret from the batch without decrypting again.
+  case Map.lookup "db_password" secrets of
+    Maybe.Nothing ->
+      Text.putStrLn "db_password not present in this file"
+    Maybe.Just secret -> do
+      code <- Process.runProcess
+        (Process.setEnv
+          [("DB_PASSWORD", Secret.toEnvValue secret)]
+          (Process.proc "env" []))
+      (Exit.exitWith code :: IO ())
