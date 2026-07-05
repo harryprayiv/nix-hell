@@ -1,0 +1,25 @@
+#!/usr/bin/env nix-hell
+-- examples/54-derivation.hell
+-- Derivation remains distinct from StorePath; instantiate returns
+-- Either now. Both the round-trip and the rejection are asserted.
+main = do
+  r <- Nix.instantiate "(import <nixpkgs> {}).hello"
+  drv <- Main.orDie r
+  Text.putStrLn ("derivation path: " <> StorePath.toText (Derivation.toStorePath drv))
+
+  let sp = Derivation.toStorePath drv
+  case Derivation.fromStorePath sp of
+    Maybe.Nothing -> Exit.die "FAIL: lost .drv suffix"
+    Maybe.Just drv2 ->
+      Text.putStrLn ("PASS: round-trip ok: " <> StorePath.toText (Derivation.toStorePath drv2))
+
+  b <- Nix.build "nixpkgs#hello"
+  path <- Main.orDie b
+  case Derivation.fromStorePath path of
+    Maybe.Nothing ->
+      Text.putStrLn "PASS: built output correctly rejected as Derivation"
+    Maybe.Just wrong ->
+      Exit.die ("FAIL: built output accepted as Derivation: "
+                 <> StorePath.toText (Derivation.toStorePath wrong))
+
+orDie = Either.either Exit.die IO.pure

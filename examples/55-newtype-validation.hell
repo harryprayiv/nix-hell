@@ -1,0 +1,33 @@
+#!/usr/bin/env nix-hell
+-- examples/55-newtype-validation.hell
+-- The smart constructors must actually be smart. StorePath.fromText
+-- now validates the 32-char nix-base32 hash and the dash; each
+-- rejection path is asserted. Flake keeps its emptiness check.
+main = do
+  -- Hash too short.
+  case StorePath.fromText "/nix/store/tooshort-foo" of
+    Maybe.Nothing -> Text.putStrLn "PASS: short hash rejected"
+    Maybe.Just p -> Exit.die ("FAIL: short hash accepted: " <> StorePath.toText p)
+
+  -- 'e' is not in the nix base32 alphabet.
+  case StorePath.fromText "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-foo" of
+    Maybe.Nothing -> Text.putStrLn "PASS: invalid alphabet rejected"
+    Maybe.Just p -> Exit.die ("FAIL: invalid alphabet accepted: " <> StorePath.toText p)
+
+  -- No dash-name after the hash.
+  case StorePath.fromText "/nix/store/0123456789abcdfghijklmnpqrsvwxyz" of
+    Maybe.Nothing -> Text.putStrLn "PASS: missing name rejected"
+    Maybe.Just p -> Exit.die ("FAIL: hash-only path accepted: " <> StorePath.toText p)
+
+  -- Correct shape (the full 32-char alphabet is itself 32 chars).
+  case StorePath.fromText "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-foo" of
+    Maybe.Just p -> Text.putStrLn ("PASS: valid shape accepted: " <> StorePath.toText p)
+    Maybe.Nothing -> Exit.die "FAIL: valid store path rejected"
+
+  case Flake.fromText "github:NixOS/nixpkgs/nixos-24.05" of
+    Maybe.Just f -> Text.putStrLn ("PASS: flake ref accepted: " <> Flake.toText f)
+    Maybe.Nothing -> Exit.die "FAIL: github ref rejected"
+
+  case Flake.fromText "   " of
+    Maybe.Nothing -> Text.putStrLn "PASS: whitespace flake ref rejected"
+    Maybe.Just f -> Exit.die ("FAIL: whitespace accepted as: " <> Flake.toText f)

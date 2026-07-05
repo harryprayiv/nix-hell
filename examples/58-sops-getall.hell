@@ -1,0 +1,18 @@
+#!/usr/bin/env nix-hell
+-- examples/58-sops-getall.hell
+main = do
+  r <- Sops.getAll "secrets/example.yaml"
+  secrets <- Main.orDie r
+  Text.putStrLn ("loaded " <> Show.show (Map.size secrets) <> " secrets")
+  Text.putStrLn ("keys: " <> Text.intercalate ", " (Map.keys secrets))
+
+  case Map.lookup "db_password" secrets of
+    Maybe.Nothing ->
+      Text.putStrLn "db_password not present in this file"
+    Maybe.Just secret -> do
+      cfg <- Secret.setEnv "DB_PASSWORD" secret
+        (Process.proc "sh" ["-c", "test -n \"$DB_PASSWORD\" && echo present"])
+      code <- Process.runProcess cfg
+      (Exit.exitWith code :: IO ())
+
+orDie = Either.either Exit.die IO.pure

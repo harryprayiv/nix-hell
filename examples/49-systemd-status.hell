@@ -1,4 +1,5 @@
 #!/usr/bin/env nix-hell
+-- examples/49-systemd-status.hell
 main = do
   let services = ["sshd", "nginx", "postgresql"]
   Monad.forM_ services \svc -> do

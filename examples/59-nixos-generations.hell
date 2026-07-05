@@ -1,0 +1,14 @@
+#!/usr/bin/env nix-hell
+-- examples/59-nixos-generations.hell
+main = do
+  g <- NixOS.generations
+  gens <- Main.orDie g
+  Text.putStrLn "system generations:"
+  Monad.forM_ (Text.lines gens) \line ->
+    Monad.when (Bool.not (Eq.eq (Text.strip line) ""))
+      (Text.putStrLn ("  " <> line))
+  s <- NixOS.currentSystem
+  sys <- Main.orDie s
+  Text.putStrLn ("current system: " <> StorePath.toText sys)
+
+orDie = Either.either Exit.die IO.pure

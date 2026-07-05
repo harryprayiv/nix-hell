@@ -1,0 +1,25 @@
+#!/usr/bin/env nix-hell
+-- examples/63-flake-graph.hell
+main = do
+  g <- Nix.flakeGraph "."
+  graph <- Main.orDie g
+  let nodes = FlakeGraph.nodes graph
+  let edges = FlakeGraph.edges graph
+  let urls = FlakeGraph.urls graph
+
+  Text.putStrLn ("nodes (" <> Show.show (List.length nodes) <> "):")
+  Monad.forM_ nodes \n ->
+    case Map.lookup n urls of
+      Maybe.Nothing -> Text.putStrLn ("  " <> n)
+      Maybe.Just u -> Text.putStrLn ("  " <> n <> " -> " <> u)
+
+  if List.null edges
+    then Text.putStrLn "no inter-input edges"
+    else Monad.forM_ edges \(from, to) ->
+      Text.putStrLn ("  " <> from <> " -> " <> to)
+
+  case FlakeGraph.detectCycles graph of
+    Maybe.Nothing -> Text.putStrLn "PASS: no cycles detected"
+    Maybe.Just cyc -> Exit.die ("CYCLE FOUND: " <> Text.intercalate " -> " cyc)
+
+orDie = Either.either Exit.die IO.pure

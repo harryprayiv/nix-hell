@@ -1,0 +1,16 @@
+#!/usr/bin/env nix-hell
+-- examples/52-gc-roots.hell
+main = do
+  r <- Nix.gcRoots
+  roots <- Main.orDie r
+  Text.putStrLn ("gc roots: " <> Show.show (List.length roots))
+  Monad.forM_ (List.take 5 roots) \x ->
+    Text.putStrLn ("  " <> StorePath.toText x)
+  b <- Nix.build "nixpkgs#hello"
+  path <- Main.orDie b
+  inStore <- Nix.isInStore (StorePath.toText path)
+  if inStore
+    then Text.putStrLn "PASS: built path is in store"
+    else Exit.die "FAIL: built path not in store?"
+
+orDie = Either.either Exit.die IO.pure

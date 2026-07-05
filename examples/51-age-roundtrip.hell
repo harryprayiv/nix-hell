@@ -1,0 +1,31 @@
+#!/usr/bin/env nix-hell
+-- examples/51-age-roundtrip.hell
+-- Age now traffics in armored Text. Also asserts Secret.writeFile
+-- creates the file with mode 600 (the write-then-chmod race is fixed;
+-- the mode should be restrictive from the first byte). This is the
+-- only place a Secret's plaintext is compared, via the deliberately
+-- loud Secret.expose.
+main = do
+  pubkey <- Text.readFile "test.pub"
+  let plaintext = "hello secret world"
+  er <- Age.encrypt (Text.strip pubkey) plaintext
+  ciphertext <- Main.orDie er
+  Text.putStrLn "encrypted (armored):"
+  Monad.forM_ (List.take 2 (Text.lines ciphertext)) \l ->
+    Text.putStrLn ("  " <> l)
+
+  dr <- Age.decrypt "/tmp/test.key" ciphertext
+  secret <- Main.orDie dr
+  if Eq.eq (Secret.expose secret) plaintext
+    then Text.putStrLn "PASS: roundtrip succeeded"
+    else Exit.die "FAIL: decrypted text differs"
+
+  let fp = "/tmp/nix-hell-secret-mode-test"
+  Secret.writeFile fp secret
+  mode <- Text.readProcessStdout_ (Process.proc "stat" ["-c", "%a", fp])
+  Directory.removeFile fp
+  if Eq.eq (Text.strip mode) "600"
+    then Text.putStrLn "PASS: secret file created with mode 600"
+    else Exit.die ("FAIL: secret file mode is " <> Text.strip mode)
+
+orDie = Either.either Exit.die IO.pure

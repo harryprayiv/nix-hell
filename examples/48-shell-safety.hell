@@ -1,0 +1,29 @@
+#!/usr/bin/env nix-hell
+-- examples/48-shell-safety.hell
+-- Escaping is asserted by round-tripping hostile input through a real
+-- shell, not by eyeballing the output. Shell.which now returns
+-- Maybe Text; re-validate as a StorePath explicitly if you need that.
+main = do
+  let dangerous = "hello; rm -rf /tmp/nope && echo $(whoami) `id` \"quoted\" 'single'"
+  out <- Text.readProcessStdout_
+    (Process.proc "sh" ["-c", "printf %s " <> Shell.escape dangerous])
+  if Eq.eq out dangerous
+    then Text.putStrLn "PASS: escape round-trips through sh"
+    else Exit.die ("FAIL: escape corrupted input, got: " <> out)
+
+  let args = ["foo bar", "it's quoted", "normal"]
+  Text.putStrLn ("list: " <> Shell.escapeList args)
+
+  mnix <- Shell.which "nix"
+  case mnix of
+    Maybe.Nothing -> Text.putStrLn "nix not found on PATH"
+    Maybe.Just p -> do
+      Text.putStrLn ("nix at: " <> p)
+      case StorePath.fromText p of
+        Maybe.Just sp -> Text.putStrLn "  ...and it validates as a store path"
+        Maybe.Nothing -> Text.putStrLn "  ...not a store path (impure PATH); which is why the type changed"
+
+  ok <- Shell.inPath "sh"
+  if ok
+    then Text.putStrLn "PASS: sh in PATH"
+    else Exit.die "FAIL: no sh on PATH"

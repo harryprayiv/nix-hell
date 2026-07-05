@@ -1,0 +1,36 @@
+#!/usr/bin/env nix-hell
+-- examples/64-cache.hell
+-- Cache API unchanged; the inner build now goes through Either.
+main = do
+  Text.putStrLn "computing (or loading from cache)..."
+  result <- Cache.getOrRun "nixpkgs-hello-path" do
+    b <- Nix.build "nixpkgs#hello"
+    path <- Main.orDie b
+    IO.pure (StorePath.toText path)
+  Text.putStrLn ("hello path: " <> result)
+
+  Cache.set "my-timestamp" "2026-07-05"
+  cached <- Cache.get "my-timestamp"
+  case cached of
+    Maybe.Nothing -> Exit.die "FAIL: set then get missed"
+    Maybe.Just val -> Text.putStrLn ("cached timestamp: " <> val)
+
+  -- Keys that collided under the old sanitizer must not collide now.
+  Cache.set "a/b" "slash"
+  Cache.set "a:b" "colon"
+  x <- Cache.get "a/b"
+  y <- Cache.get "a:b"
+  case (x, y) of
+    (Maybe.Just "slash", Maybe.Just "colon") ->
+      Text.putStrLn "PASS: a/b and a:b are distinct cache keys"
+    (p, q) -> Exit.die "FAIL: cache key collision"
+
+  Cache.invalidate "my-timestamp"
+  Cache.invalidate "a/b"
+  Cache.invalidate "a:b"
+  after <- Cache.get "my-timestamp"
+  case after of
+    Maybe.Nothing -> Text.putStrLn "PASS: invalidation worked"
+    Maybe.Just stale -> Exit.die ("FAIL: entry still present: " <> stale)
+
+orDie = Either.either Exit.die IO.pure

@@ -1,0 +1,19 @@
+#!/usr/bin/env nix-hell
+-- examples/60-systemd-manage.hell
+main = do
+  let unit = "sshd"
+  Text.putStrLn ("--- status of " <> unit <> " ---")
+  status <- Systemd.status unit
+  Text.putStrLn (Text.take 200 status)
+
+  Text.putStrLn ("--- last 20 log lines ---")
+  logs <- Systemd.logs unit
+  let lastLines = List.take 20 (List.reverse (Text.lines logs))
+  Monad.forM_ (List.reverse lastLines) Text.putStrLn
+
+  Text.putStrLn ("--- restarting " <> unit <> " ---")
+  code <- Systemd.restart unit
+  Exit.exitCode
+    (Text.putStrLn "restart succeeded")
+    (\i -> Text.putStrLn ("restart exited with: " <> Show.show i))
+    code

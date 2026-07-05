@@ -1,0 +1,11 @@
+#!/usr/bin/env nix-hell
+-- examples/50-nixos-info.hell
+-- NixOS.currentSystem returns Either, so this script is now portable:
+-- on non-NixOS it reports and exits zero instead of crashing.
+main = do
+  r <- NixOS.currentSystem
+  case r of
+    Either.Left err ->
+      Text.putStrLn ("not NixOS (or readlink failed): " <> err)
+    Either.Right sys ->
+      Text.putStrLn ("current system: " <> StorePath.toText sys)

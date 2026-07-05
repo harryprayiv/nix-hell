@@ -1,8 +1,15 @@
 #!/usr/bin/env nix-hell
+-- examples/45-flake-info.hell
+-- Nix.flakeInputs and Nix.flakeMetadata, Either-based. Run from a
+-- directory containing flake.lock; a Left is a real failure here.
 main = do
-  inputs <- Nix.flakeInputs "."
+  r <- Nix.flakeInputs "."
+  inputs <- Main.orDie r
   Text.putStrLn ("flake inputs (" <> Show.show (Map.size inputs) <> "):")
   Monad.forM_ (Map.toList inputs) \(k, v) ->
     Text.putStrLn ("  " <> k <> " -> " <> v)
-  meta <- Nix.flakeMetadata "."
+  m <- Nix.flakeMetadata "."
+  meta <- Main.orDie m
   Text.putStrLn ("metadata: " <> Text.decodeUtf8 (Json.encode meta))
+
+orDie = Either.either Exit.die IO.pure

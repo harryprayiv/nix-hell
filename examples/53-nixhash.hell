@@ -1,0 +1,25 @@
+#!/usr/bin/env nix-hell
+-- examples/53-nixhash.hell
+-- Hash determinism is asserted, not printed and forgotten.
+main = do
+  b <- Nix.build "nixpkgs#hello"
+  path <- Main.orDie b
+  h <- NixHash.sha256Path path
+  hash <- Main.orDie h
+  Text.putStrLn ("sha256 of hello: " <> NixHash.toText hash)
+
+  h2 <- NixHash.sha256Text "hello, nix-hell"
+  hash2 <- Main.orDie h2
+  h3 <- NixHash.sha256Text "hello, nix-hell"
+  hash3 <- Main.orDie h3
+  if Eq.eq hash2 hash3
+    then Text.putStrLn "PASS: identical content produces identical hash"
+    else Exit.die "FAIL: hash is not deterministic"
+
+  h4 <- NixHash.sha256Text "different content"
+  hash4 <- Main.orDie h4
+  if Eq.eq hash2 hash4
+    then Exit.die "FAIL: different content produced identical hash"
+    else Text.putStrLn "PASS: different content produces different hash"
+
+orDie = Either.either Exit.die IO.pure

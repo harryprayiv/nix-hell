@@ -1,0 +1,23 @@
+#!/usr/bin/env nix-hell
+-- examples/61-nixexpr.hell
+-- Serialization is pure and unchanged; eval now returns Either.
+main = do
+  Text.putStrLn (NixExpr.toText (NixExpr.str "hello"))
+  Text.putStrLn (NixExpr.toText (NixExpr.int 42))
+  Text.putStrLn (NixExpr.toText NixExpr.true)
+  Text.putStrLn (NixExpr.toText NixExpr.null)
+  Text.putStrLn (NixExpr.toText
+    (NixExpr.list [NixExpr.int 1, NixExpr.int 2, NixExpr.int 3]))
+  Text.putStrLn (NixExpr.toText (NixExpr.attrs
+    [ ("name", NixExpr.str "nix-hell")
+    , ("stable", NixExpr.true)
+    , ("count", NixExpr.int 99)
+    ]))
+  Text.putStrLn (NixExpr.toText
+    (NixExpr.str "path ${builtins.storePath} \"quoted\""))
+
+  r <- NixExpr.eval (NixExpr.attrs [("x", NixExpr.int 40), ("y", NixExpr.int 2)])
+  result <- Main.orDie r
+  Text.putStrLn ("eval result: " <> Text.decodeUtf8 (Json.encode result))
+
+orDie = Either.either Exit.die IO.pure

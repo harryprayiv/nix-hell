@@ -1,0 +1,23 @@
+#!/usr/bin/env nix-hell
+-- examples/46-nix-build.hell
+-- Positive AND negative build. The negative case is the point of the
+-- Either refactor: a bad attribute yields Left and a live interpreter,
+-- not a dead one.
+main = do
+  r <- Nix.build "nixpkgs#hello"
+  path <- Main.orDie r
+  Text.putStrLn ("built: " <> StorePath.toText path)
+  q <- Nix.queryRequisites path
+  reqs <- Main.orDie q
+  Text.putStrLn ("requisites: " <> Show.show (List.length reqs))
+  Monad.forM_ (List.take 5 reqs) \x ->
+    Text.putStrLn ("  " <> StorePath.toText x)
+
+  bad <- Nix.build "nixpkgs#definitely-not-a-real-attribute-xyz"
+  case bad of
+    Either.Left err ->
+      Text.putStrLn "PASS: bogus attribute produced Left, interpreter survived"
+    Either.Right p ->
+      Exit.die ("FAIL: bogus build succeeded: " <> StorePath.toText p)
+
+orDie = Either.either Exit.die IO.pure

@@ -1,0 +1,170 @@
+#!/usr/bin/env nix-hell
+-- scripts/test-all.hell
+--
+-- Two phases: typecheck every example concurrently, then run the
+-- curated runnable subset sequentially with per-script timing.
+-- Optional groups are off by default; enable with switches.
+--
+--   nix-hell scripts/test-all.hell --bin ./result/bin/nix-hell --slow --nixos
+
+data Opts = Opts {
+  bin :: Text, dir :: Text,
+  slow :: Bool, sops :: Bool, age :: Bool,
+  sudo :: Bool, nixos :: Bool, net :: Bool
+ }
+
+options =
+  (\bin dir slow sops age sudo nixos net ->
+     Main.Opts {bin, dir, slow, sops, age, sudo, nixos, net})
+    <$> Options.strOption (Option.long "bin" <> Option.value "nix-hell" <> Option.help "nix-hell binary to test")
+    <*> Options.strOption (Option.long "dir" <> Option.value "examples" <> Option.help "examples directory")
+    <*> Options.switch (Flag.long "slow" <> Flag.help "run examples that invoke nix build")
+    <*> Options.switch (Flag.long "sops" <> Flag.help "run examples needing secrets/example.yaml")
+    <*> Options.switch (Flag.long "age" <> Flag.help "run examples needing test.pub and /tmp/test.key")
+    <*> Options.switch (Flag.long "sudo" <> Flag.help "run examples needing privileged systemctl")
+    <*> Options.switch (Flag.long "nixos" <> Flag.help "run NixOS-only examples")
+    <*> Options.switch (Flag.long "net" <> Flag.help "run examples needing external network")
+
+main = do
+  opts <- Options.execParser (Options.info (Main.options <**> Options.helper) Options.fullDesc)
+  let bin = Record.get @"bin" opts
+  let dir = Record.get @"dir" opts
+  let slow = Record.get @"slow" @Bool opts
+  let sops = Record.get @"sops" @Bool opts
+  let age = Record.get @"age" @Bool opts
+  let sudo = Record.get @"sudo" @Bool opts
+  let nixos = Record.get @"nixos" @Bool opts
+  let net = Record.get @"net" @Bool opts
+
+  -- Phase 1: every .hell file in the directory must typecheck.
+  Text.putStrLn "=== phase 1: typecheck ==="
+  files0 <- Directory.listDirectory dir
+  let files = List.sort (List.filter (Text.isSuffixOf ".hell") files0)
+  checks <- Async.pooledForConcurrently files \f -> do
+    (code, out, err) <- Text.readProcess (Process.proc bin ["--check", dir <> "/" <> f])
+    IO.pure (f, code, err)
+  checkFails0 <- Monad.forM checks \(f, code, err) ->
+    case code of
+      Exit.ExitSuccess -> do
+        Text.putStrLn ("  check ok    " <> f)
+        IO.pure 0
+      Exit.ExitFailure i -> do
+        Text.putStrLn ("  CHECK FAIL  " <> f)
+        Monad.forM_ (List.take 3 (Text.lines err)) \l ->
+          Text.putStrLn ("    " <> l)
+        IO.pure 1
+  let checkFails = List.foldl' Int.plus 0 checkFails0
+
+  -- Phase 2: run the curated subset. Sequential on purpose: several
+  -- of these hit the nix store and stampeding builds helps nobody.
+  Text.putStrLn ""
+  Text.putStrLn "=== phase 2: run ==="
+  let runs =
+        [ ("01-hello-world.hell",        [], Bool.True,  "")
+        , ("02-interaction.hell",        [], Bool.False, "stdin")
+        , ("03-press-any-key.hell",      [], Bool.False, "stdin")
+        , ("04-writing-files.hell",      [], Bool.True,  "")
+        , ("05-lists.hell",              [], Bool.True,  "")
+        , ("06-polymorphism.hell",       [], Bool.True,  "")
+        , ("07-loops.hell",              [], Bool.False, "stdin")
+        , ("08-tuples.hell",             [], Bool.True,  "")
+        , ("09-processes.hell",          [], Bool.True,  "")
+        , ("10-current-directory.hell",  [], Bool.True,  "")
+        , ("11-env-vars.hell",           [], Bool.True,  "")
+        , ("12-fib.hell",                [], Bool.True,  "")
+        , ("13-concurrency.hell",        [], net,        "--net")
+        , ("14-text.hell",               [], Bool.True,  "")
+        , ("15-type-classes.hell",       [], Bool.True,  "")
+        , ("16-if.hell",                 [], Bool.True,  "")
+        , ("17-reuse.hell",              [], Bool.True,  "")
+        , ("18-monads.hell",             [], Bool.True,  "")
+        , ("19-blog-generator.hell",     [], Bool.False, "pandoc + posts dir")
+        , ("20-dollar.hell",             [], Bool.True,  "")
+        , ("21-json.hell",               [], Bool.True,  "")
+        , ("22-records.hell",            [], Bool.True,  "")
+        , ("23-args.hell",               ["one", "two"], Bool.True, "")
+        , ("24-exitcode.hell",           [], Bool.True,  "")
+        , ("25-sum-types.hell",          [], Bool.True,  "")
+        , ("26-reference-other-types.hell", [], Bool.True, "")
+        , ("27-discussion-64.hell",      [], Bool.True,  "")
+        , ("28-trees.hell",              [], Bool.True,  "")
+        , ("29-temp-files.hell",         [], Bool.True,  "")
+        , ("30-process-handlers.hell",   [], Bool.True,  "")
+        , ("31-open-file-handle.hell",   [], Bool.True,  "")
+        , ("32-optparse.hell",           [], Bool.True,  "")
+        , ("33-null-stream.hell",        [], Bool.True,  "")
+        , ("34-field-puns.hell",         [], Bool.True,  "")
+        , ("35-type-sigs.hell",          [], Bool.True,  "")
+        , ("36-these.hell",              [], Bool.True,  "")
+        , ("37-readshow.hell",           [], Bool.True,  "")
+        , ("38-integer.hell",            [], Bool.True,  "")
+        , ("39-day.hell",                [], Bool.True,  "")
+        , ("40-utctime.hell",            [], Bool.True,  "")
+        , ("41-commands.hell",           ["list"], Bool.True, "")
+        , ("42-primcase.hell",           [], Bool.True,  "")
+        , ("43-http.hell",               [], Bool.False, "long-running server")
+        , ("44-char.hell",               [], Bool.False, "stdin")
+        , ("45-flake-info.hell",         [], Bool.True,  "")
+        , ("46-nix-build.hell",          [], slow,       "--slow")
+        , ("47-secret-usage.hell",       [], sops,       "--sops")
+        , ("48-shell-safety.hell",       [], Bool.True,  "")
+        , ("49-systemd-status.hell",     [], Bool.True,  "")
+        , ("50-nixos-info.hell",         [], Bool.True,  "")
+        , ("51-age-roundtrip.hell",      [], age,        "--age")
+        , ("52-gc-roots.hell",           [], slow,       "--slow")
+        , ("53-nixhash.hell",            [], slow,       "--slow")
+        , ("54-derivation.hell",         [], slow,       "--slow")
+        , ("55-newtype-validation.hell", [], Bool.True,  "")
+        , ("56-profile-list.hell",       [], Bool.True,  "")
+        , ("57-store-add-root.hell",     [], Bool.True,  "")
+        , ("58-sops-getall.hell",        [], sops,       "--sops")
+        , ("59-nixos-generations.hell",  [], nixos,      "--nixos")
+        , ("60-systemd-manage.hell",     [], sudo,       "--sudo")
+        , ("61-nixexpr.hell",            [], Bool.True,  "")
+        , ("62-mkderivation.hell",       [], slow,       "--slow")
+        , ("63-flake-graph.hell",        [], Bool.True,  "")
+        , ("64-cache.hell",              [], slow,       "--slow")
+        , ("65-flake-check.hell",        [], slow,       "--slow")
+        ]
+
+  results <- Monad.forM runs \(f, extraArgs, enabled, why) ->
+    if Bool.not enabled
+      then do
+        Text.putStrLn ("  skip        " <> f <>
+          (if Eq.eq why "" then "" else "  (" <> why <> ")"))
+        IO.pure (f, "skip")
+      else do
+        Text.putStr ("  run         " <> f <> " ... ")
+        t0 <- UTCTime.getCurrentTime
+        (code, out, err) <- Text.readProcess
+          (Process.proc bin (List.cons (dir <> "/" <> f) extraArgs))
+        t1 <- UTCTime.getCurrentTime
+        let secs = UTCTime.diffUTCTime t1 t0
+        case code of
+          Exit.ExitSuccess -> do
+            Text.putStrLn ("ok (" <> Double.showFFloat (Maybe.Just 1) secs "" <> "s)")
+            IO.pure (f, "pass")
+          Exit.ExitFailure i -> do
+            Text.putStrLn ("FAIL (exit " <> Show.show i <> ")")
+            Monad.forM_ (List.take 5 (Text.lines err)) \l ->
+              Text.putStrLn ("    " <> l)
+            IO.pure (f, "fail")
+
+  let passes = List.length (List.filter (\(a, s) -> Eq.eq s "pass") results)
+  let fails = List.length (List.filter (\(b, s) -> Eq.eq s "fail") results)
+  let skips = List.length (List.filter (\(c, s) -> Eq.eq s "skip") results)
+
+  Text.putStrLn ""
+  Text.putStrLn ("check failures: " <> Show.show checkFails
+    <> "  run passed: " <> Show.show passes
+    <> "  run failed: " <> Show.show fails
+    <> "  skipped: " <> Show.show skips)
+
+  if Ord.gt (Int.plus checkFails fails) 0
+    then do
+      Monad.when (Ord.gt fails 0) do
+        Text.putStrLn "failures:"
+        Monad.forM_ results \(f, status) ->
+          Monad.when (Eq.eq status "fail") (Text.putStrLn ("  " <> f))
+      Exit.exitWith (Exit.ExitFailure (Int.plus checkFails fails))
+    else Text.putStrLn "all good"

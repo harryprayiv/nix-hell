@@ -1,0 +1,4 @@
+-- examples/44-char.hell  (from upstream; runner skips: stdin)
+main = do
+  line <- Text.getLine
+  IO.print $ Text.all (Eq.eq 'x') line
