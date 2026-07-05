@@ -842,7 +842,7 @@ newtype Instances = Instances {getInstances ::Map (SomeTypeRep, SomeTypeRep) Dyn
 instances :: Instances
 instances =
   Instances $
-    Map.fromList
+    Map.fromList $
       [ entail1 @Show @[],
         entail1 @Show @Set,
         entail1 @Show @CI,
@@ -941,25 +941,20 @@ instances =
         instance1 @Semigroup @[],
         instance0 @FoldCase @Text,
         instance0 @FoldCase @ByteString,
-        -- NixHell types
-        instance0 @Show @NixHell.StorePath,
-        instance0 @Eq   @NixHell.StorePath,
-        instance0 @Ord  @NixHell.StorePath,
-        instance0 @Show @NixHell.NixHash,
-        instance0 @Eq   @NixHell.NixHash,
-        instance0 @Ord  @NixHell.NixHash,
-        instance0 @Show @NixHell.Derivation,
-        instance0 @Eq   @NixHell.Derivation,
-        instance0 @Ord  @NixHell.Derivation,
-        instance0 @Show @NixHell.Flake,
-        instance0 @Eq   @NixHell.Flake,
-        instance0 @Show @NixHell.NixExpr,
-        instance0 @Eq   @NixHell.NixExpr,
-        instance0 @Show @NixHell.DerivationSpec,
-        instance0 @Eq   @NixHell.DerivationSpec,
-        instance0 @Show @NixHell.FlakeGraph,
-        instance0 @Eq   @NixHell.FlakeGraph
+        -- Unit and containers needed for NixHell result types.
+        -- Either Text (Map Text StorePath) etc. resolve through these
+        -- via entailment recursion. Upstream-PR-worthy.
+        instance0 @Show @(),
+        instance0 @Eq @(),
+        instance0 @Ord @(),
+        entail2 @Show @Map,
+        entail2 @Eq @Map,
+        entail2 @Ord @Map,
+        entail2 @Show @These,
+        entail2 @Eq @These,
+        entail2 @Ord @These
       ]
+        <> NixHell.nixInstances
 
 --------------------------------------------------------------------------------
 -- Instance declarations
@@ -1707,7 +1702,7 @@ freeVariables =
 
 supportedTypeConstructors :: Map String SomeTypeRep
 supportedTypeConstructors =
-  Map.fromList
+  Map.fromList $
     [ -- Standard Haskell types
       ("Bool", SomeTypeRep $ typeRep @Bool),
       ("Int", SomeTypeRep $ typeRep @Int),
@@ -1734,15 +1729,6 @@ supportedTypeConstructors =
       ("TimeOfDay", SomeTypeRep $ typeRep @TimeOfDay),
       ("Builder", SomeTypeRep $ typeRep @Builder),
       ("CI", SomeTypeRep $ typeRep @CI),
-      -- NixHell types
-      ("StorePath", SomeTypeRep $ typeRep @NixHell.StorePath),
-      ("Secret", SomeTypeRep $ typeRep @NixHell.Secret),
-      ("NixHash", SomeTypeRep $ typeRep @NixHell.NixHash),
-      ("Derivation", SomeTypeRep $ typeRep @NixHell.Derivation),
-      ("Flake", SomeTypeRep $ typeRep @NixHell.Flake),
-      ("NixExpr", SomeTypeRep $ typeRep @NixHell.NixExpr),
-      ("DerivationSpec", SomeTypeRep $ typeRep @NixHell.DerivationSpec),
-      ("FlakeGraph", SomeTypeRep $ typeRep @NixHell.FlakeGraph),
       -- Internal, hidden types
       ("hell:Hell.NilL", SomeTypeRep $ typeRep @('NilL)),
       ("hell:Hell.ConsL", SomeTypeRep $ typeRep @('ConsL)),
@@ -1751,6 +1737,7 @@ supportedTypeConstructors =
       ("hell:Hell.Tagged", SomeTypeRep $ typeRep @Tagged),
       ("hell:Hell.Nullary", SomeTypeRep $ typeRep @Nullary)
     ]
+      <> NixHell.nixTypes
 
 -- | Used for constructors with no slot. E.g. True :: Nullary -> Bool
 data Nullary = Nullary
@@ -1760,7 +1747,7 @@ data Nullary = Nullary
 
 supportedLits :: Map String (UTerm (), SomeTypeRep)
 supportedLits =
-  Map.fromList
+  Map.fromList $
     [ -- Text I/O
       lit' "Text.putStrLn" t_putStrLn,
       lit' "Text.hPutStr" t_hPutStr,
@@ -1955,104 +1942,24 @@ supportedLits =
       lit' "Http.getRequestBodyChunk" Wai.getRequestBodyChunk,
       lit' "Http.consumeRequestBodyStrict" (fmap L.toStrict . Wai.consumeRequestBodyStrict),
       -- Builder
-      lit' "Builder.byteString" Builder.byteString,
-      -- StorePath
-      lit' "StorePath.fromText"      NixHell.storePath_fromText,
-      lit' "StorePath.toText"        NixHell.storePath_toText,
-      -- Nix store
-      lit' "Nix.build"               NixHell.nix_build,
-      lit' "Nix.buildFlakeAttr"      NixHell.nix_buildFlakeAttr,
-      lit' "Nix.storeAdd"            NixHell.nix_storeAdd,
-      lit' "Nix.isInStore"           NixHell.nix_isInStore,
-      lit' "Nix.queryRequisites"     NixHell.nix_queryRequisites,
-      lit' "Nix.copy"                NixHell.nix_copy,
-      lit' "Nix.sign"                NixHell.nix_sign,
-      -- Nix eval and flake
-      lit' "Nix.eval"                NixHell.nix_eval,
-      lit' "Nix.evalFlakeAttr"       NixHell.nix_evalFlakeAttr,
-      lit' "Nix.instantiate"         NixHell.nix_instantiate,
-      lit' "Nix.flakeMetadata"       NixHell.nix_flakeMetadata,
-      lit' "Nix.flakeUpdate"         NixHell.nix_flakeUpdate,
-      lit' "Nix.flakeLock"           NixHell.nix_flakeLock,
-      lit' "Nix.flakeInputs"         NixHell.nix_flakeInputs,
-      -- Profile and GC
-      lit' "Nix.profileInstall"      NixHell.nix_profileInstall,
-      lit' "Nix.profileRemove"       NixHell.nix_profileRemove,
-      lit' "Nix.gcCollect"           NixHell.nix_gcCollect,
-      lit' "Nix.gcRoots"             NixHell.nix_gcRoots,
-      lit' "Nix.optimiseStore"       NixHell.nix_optimiseStore,
-      -- Sops
-      lit' "Sops.get"                NixHell.sops_get,
-      lit' "Sops.getAll"             NixHell.sops_getAll,
-      lit' "Secret.toEnvValue"       NixHell.secret_toEnvValue,
-      lit' "Secret.writeFile"        NixHell.secret_writeFile,
-      -- Age
-      lit' "Age.encrypt"             NixHell.age_encrypt,
-      lit' "Age.decrypt"             NixHell.age_decrypt,
-      lit' "Ssh.toAge"               NixHell.ssh_toAge,
-      -- Shell safety
-      lit' "Shell.escape"            NixHell.shell_escape,
-      lit' "Shell.escapeList"        NixHell.shell_escapeList,
-      lit' "Shell.which"             NixHell.shell_which,
-      lit' "Shell.inPath"            NixHell.shell_inPath,
-      -- NixOS
-      lit' "NixOS.rebuild"           NixHell.nixos_rebuild,
-      lit' "NixOS.currentSystem"     NixHell.nixos_currentSystem,
-      lit' "NixOS.option"            NixHell.nixos_option,
-      lit' "NixOS.generations"       NixHell.nixos_generations,
-      lit' "NixOS.rollback"          NixHell.nixos_rollback,
-      -- Systemd
-      lit' "Systemd.status"          NixHell.systemd_status,
-      lit' "Systemd.start"           NixHell.systemd_start,
-      lit' "Systemd.stop"            NixHell.systemd_stop,
-      lit' "Systemd.restart"         NixHell.systemd_restart,
-      lit' "Systemd.logs"            NixHell.systemd_logs,
-      -- NixHash
-      lit' "NixHash.sha256Path"      NixHell.nixHash_sha256Path,
-      lit' "NixHash.sha256Text"      NixHell.nixHash_sha256Text,
-      lit' "NixHash.toText"          NixHell.nixHash_toText,
-      -- Derivation
-      lit' "Derivation.fromStorePath" NixHell.derivation_fromStorePath,
-      lit' "Derivation.toStorePath"   NixHell.derivation_toStorePath,
-      -- Flake
-      lit' "Flake.fromText"          NixHell.flake_fromText,
-      lit' "Flake.toText"            NixHell.flake_toText,
-      -- Profile additions
-      lit' "Nix.profileList"         NixHell.nix_profileList,
-      lit' "Nix.addRoot"             NixHell.nix_addRoot,
-      -- Phase 2: NixExpr
-      lit' "NixExpr.str"             NixHell.nixExpr_str,
-      lit' "NixExpr.int"             NixHell.nixExpr_int,
-      lit' "NixExpr.bool"            NixHell.nixExpr_bool,
-      lit' "NixExpr.true"            NixHell.nixExpr_true,
-      lit' "NixExpr.false"           NixHell.nixExpr_false,
-      lit' "NixExpr.null"            NixHell.nixExpr_null,
-      lit' "NixExpr.list"            NixHell.nixExpr_list,
-      lit' "NixExpr.attrs"           NixHell.nixExpr_attrs,
-      lit' "NixExpr.path"            NixHell.nixExpr_path,
-      lit' "NixExpr.toText"          NixHell.nixExpr_toText,
-      lit' "NixExpr.eval"            NixHell.nixExpr_eval,
-      -- Phase 2: DerivationSpec
-      lit' "DerivationSpec.make"     NixHell.derivationSpec_make,
-      lit' "Nix.mkDerivation"        NixHell.nix_mkDerivation,
-      lit' "Nix.realise"             NixHell.nix_realise,
-      -- Phase 2: FlakeGraph
-      lit' "Nix.flakeGraph"          NixHell.nix_flakeGraph,
-      lit' "FlakeGraph.nodes"        NixHell.flakeGraph_nodes,
-      lit' "FlakeGraph.edges"        NixHell.flakeGraph_edges,
-      lit' "FlakeGraph.urls"         NixHell.flakeGraph_urls,
-      lit' "FlakeGraph.detectCycles" NixHell.flakeGraph_detectCycles,
-      -- Phase 2: Cache
-      lit' "Cache.get"               NixHell.cache_get,
-      lit' "Cache.set"               NixHell.cache_set,
-      lit' "Cache.getOrRun"          NixHell.cache_getOrRun,
-      lit' "Cache.invalidate"        NixHell.cache_invalidate,
-      -- Phase 2: flake check
-      lit' "Nix.checkFlakeOutputs"   NixHell.nix_checkFlakeOutputs
+      lit' "Builder.byteString" Builder.byteString
     ]
+      <> map nixLit NixHell.nixLits
   where
     lit' :: forall a. (Type.Typeable a) => String -> a -> (String, (UTerm (), SomeTypeRep))
     lit' str x = (str, (lit (NameP str) x, SomeTypeRep $ Type.typeOf x))
+
+    -- Register a NixHell primitive. The Dynamic pattern match yields
+    -- exactly the (TypeRep a, a) pair that litWithSpanBare needs, so
+    -- NixHell stays free of Hell's internal UTerm machinery and the
+    -- fork's merge surface stays at three splice points.
+    nixLit :: (String, Dynamic) -> (String, (UTerm (), SomeTypeRep))
+    nixLit (name, Dynamic rep x) =
+      ( name,
+        ( litWithSpanBare (NameP name) HSE.noSrcSpan rep x,
+          SomeTypeRep rep
+        )
+      )
 
     showsHelper ::
       (Maybe Int -> Double -> (String -> String)) ->
@@ -2671,7 +2578,7 @@ t_readFile :: Text -> IO Text
 t_readFile fp = fmap Text.decodeUtf8 (ByteString.readFile (Text.unpack fp))
 
 -- Same as Warp.run, but with HTTP/2 support disabled.
--- Stick to HTTP/1.2; simpler, fewer moving parts.
+-- Stick to HTTP/1.1; simpler, fewer moving parts.
 warp_run :: Int -> Wai.Application -> IO ()
 warp_run p = Warp.runSettings (Warp.setHTTP2Disabled $ Warp.setPort p $ Warp.defaultSettings)
 

@@ -1,7 +1,30 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+
+-- | NixHell: typed Nix primitives for the Hell scripting language.
+--
+-- Design rules:
+--
+--   1. Anything that talks to an external process or the filesystem
+--      returns @Either Text a@. The guest language has no exceptions;
+--      Left is the only honest failure channel. Crashing the
+--      interpreter with 'error' is forbidden in this module.
+--
+--   2. Newtypes carry validated invariants or they don't exist.
+--      'StorePath' checks the store hash. 'Secret' never gains a Show
+--      instance and only leaves the type via explicitly-named escape
+--      hatches ('secret_expose') or capability-style sinks
+--      ('secret_setEnv', 'secret_writeFile').
+--
+--   3. The fork's merge surface with upstream Hell is three splice
+--      points, fed by 'nixTypes', 'nixLits', and 'nixInstances'.
+--      Adding a primitive means editing this file only.
 
 module NixHell
   ( -- Types
@@ -13,11 +36,16 @@ module NixHell
   , NixExpr(..)
   , DerivationSpec(..)
   , FlakeGraph(..)
+    -- Registration lists for Hell.hs (the only integration surface)
+  , nixTypes
+  , nixLits
+  , nixInstances
     -- StorePath
   , storePath_fromText
   , storePath_toText
     -- Secret
-  , secret_toEnvValue
+  , secret_expose
+  , secret_setEnv
   , secret_writeFile
     -- NixHash
   , nixHash_sha256Path
@@ -107,28 +135,39 @@ module NixHell
   , systemd_logs
   ) where
 
+import Control.Exception (IOException, try)
+import Control.Monad (guard)
 import Data.Aeson (Value)
 import qualified Data.Aeson as Json
 import qualified Data.Aeson.KeyMap as KeyMap
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as L
+import Data.Char (isAlphaNum, isAscii, ord)
+import Data.Constraint (Dict (..))
+import Data.Dynamic (Dynamic, toDyn)
+import Data.Kind (Constraint, Type)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Numeric (showHex)
 import qualified System.Directory as Dir
-import System.Environment (getEnv)
+import System.Environment (getEnv, getEnvironment)
 import qualified System.IO as IO
-import System.Process.Typed as Process
 import qualified System.IO.Temp as Temp
+import qualified System.Posix.Files as PosixFiles
+import qualified System.Posix.IO as PosixIO
+import System.Process.Typed as Process
+import Type.Reflection (SomeTypeRep (..), Typeable, typeRep)
 
 --------------------------------------------------------------------------------
 -- Types
 
 -- | A validated Nix store path. Opaque: only constructible by
--- trusted primitives. Scripts cannot produce one from raw Text.
+-- trusted primitives or by 'storePath_fromText', which checks the
+-- store hash. Scripts cannot forge one from arbitrary Text.
 newtype StorePath = StorePath Text
   deriving (Eq, Ord)
 
@@ -136,7 +175,9 @@ instance Show StorePath where
   show (StorePath t) = Text.unpack t
 
 -- | An opaque secret value. No Show instance: secrets cannot flow
--- into display, logging, or string concatenation.
+-- into display, logging, or string concatenation. Leaving the type
+-- requires 'secret_expose' (loud on purpose) or a capability-style
+-- sink ('secret_setEnv', 'secret_writeFile').
 newtype Secret = Secret Text
 
 -- | A Nix content hash in SRI format (sha256-<base64>). Only
@@ -157,7 +198,7 @@ instance Show Derivation where
 
 -- | A validated flake reference.
 newtype Flake = Flake Text
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show Flake where
   show (Flake t) = Text.unpack t
@@ -172,7 +213,7 @@ data NixExpr
   | NixEList [NixExpr]
   | NixEAttrs [(Text, NixExpr)]
   | NixEPath StorePath
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show NixExpr where
   show = Text.unpack . nixExpr_toText
@@ -202,13 +243,60 @@ instance Show FlakeGraph where
   show fg = "FlakeGraph{" <> show (length fg.fg_nodes) <> " nodes}"
 
 --------------------------------------------------------------------------------
+-- Process helpers: the single failure model for this module
+--
+-- Note: the Left message embeds `show cfg`, which for typed-process
+-- includes the raw command line. All ProcessConfigs built in this
+-- module carry no secrets in argv or env, so this is safe here. Do
+-- not route a config produced by 'secret_setEnv' through these.
+
+tshow :: (Show a) => a -> Text
+tshow = Text.pack . show
+
+decodeL :: L.ByteString -> Text
+decodeL = Text.decodeUtf8 . L.toStrict
+
+-- | Run a process. Right is the stripped stdout; Left is a diagnostic
+-- containing the command, exit code, and stderr.
+run :: ProcessConfig stdin stdout stderr -> IO (Either Text Text)
+run cfg = do
+  (code, out, err) <- readProcess cfg
+  pure $ case code of
+    ExitSuccess -> Right (Text.strip (decodeL out))
+    ExitFailure n ->
+      Left $ tshow cfg <> ": exit " <> tshow n <> ": " <> Text.strip (decodeL err)
+
+-- | Run a process expected to emit JSON on stdout.
+runJson :: ProcessConfig stdin stdout stderr -> IO (Either Text Value)
+runJson cfg = do
+  (code, out, err) <- readProcess cfg
+  pure $ case code of
+    ExitFailure n ->
+      Left $ tshow cfg <> ": exit " <> tshow n <> ": " <> Text.strip (decodeL err)
+    ExitSuccess ->
+      case Json.eitherDecode out of
+        Left e  -> Left $ "invalid JSON from " <> tshow cfg <> ": " <> Text.pack e
+        Right v -> Right v
+
+--------------------------------------------------------------------------------
 -- StorePath utilities
 
+-- | The nix base-32 alphabet (no e, o, t, u).
+nixBase32Chars :: String
+nixBase32Chars = "0123456789abcdfghijklmnpqrsvwxyz"
+
+-- | Validate a store path: /nix/store/<32 base32 chars>-<name>.
+-- A prefix check alone is not validation; this is the invariant the
+-- newtype claims to carry, so it gets checked.
 storePath_fromText :: Text -> Maybe StorePath
-storePath_fromText t =
-  if Text.isPrefixOf "/nix/store/" t
-    then Just (StorePath t)
-    else Nothing
+storePath_fromText t = do
+  rest <- Text.stripPrefix "/nix/store/" t
+  let (hash, name) = Text.splitAt 32 rest
+  guard (Text.length hash == 32)
+  guard (Text.all (`elem` nixBase32Chars) hash)
+  guard (Text.isPrefixOf "-" name)
+  guard (Text.length name > 1)
+  pure (StorePath t)
 
 storePath_toText :: StorePath -> Text
 storePath_toText (StorePath t) = t
@@ -216,30 +304,55 @@ storePath_toText (StorePath t) = t
 --------------------------------------------------------------------------------
 -- Secret utilities
 
-secret_toEnvValue :: Secret -> Text
-secret_toEnvValue (Secret t) = t
+-- | Escape hatch: yields the plaintext. Named so its use is legible
+-- in scripts. Prefer 'secret_setEnv' or 'secret_writeFile'.
+secret_expose :: Secret -> Text
+secret_expose (Secret t) = t
 
+-- | Add one environment variable containing a secret to a process
+-- config, inheriting the current environment. The plaintext never
+-- appears as a guest-language value.
+secret_setEnv ::
+  Text -> Secret -> ProcessConfig () () () -> IO (ProcessConfig () () ())
+secret_setEnv name (Secret v) cfg = do
+  env <- getEnvironment
+  pure $ Process.setEnv (env ++ [(Text.unpack name, Text.unpack v)]) cfg
+
+-- | Write a secret to a file created with mode 0600. The file is
+-- opened with restrictive permissions before any content is written,
+-- closing the write-then-chmod race. If the file pre-existed with
+-- loose permissions, the mode is clamped, but a pre-existing open fd
+-- held by another process retains access; delete-and-recreate if that
+-- threat matters to you. Requires unix >= 2.8.
 secret_writeFile :: Text -> Secret -> IO ()
 secret_writeFile path (Secret t) = do
-  ByteString.writeFile (Text.unpack path) (Text.encodeUtf8 t)
-  runProcess_ (proc "chmod" ["600", Text.unpack path])
+  let fp = Text.unpack path
+  fd <-
+    PosixIO.openFd
+      fp
+      PosixIO.WriteOnly
+      PosixIO.defaultFileFlags
+        { PosixIO.creat = Just 0o600
+        , PosixIO.trunc = True
+        }
+  PosixFiles.setFileMode fp 0o600
+  h <- PosixIO.fdToHandle fd
+  ByteString.hPutStr h (Text.encodeUtf8 t)
+  IO.hClose h
 
 --------------------------------------------------------------------------------
 -- NixHash utilities
 
-nixHash_sha256Path :: StorePath -> IO NixHash
-nixHash_sha256Path (StorePath p) = do
-  out <- readProcessStdout_
-    (proc "nix" ["hash", "path", Text.unpack p])
-  pure $ NixHash $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
+nixHash_sha256Path :: StorePath -> IO (Either Text NixHash)
+nixHash_sha256Path (StorePath p) =
+  fmap (fmap NixHash) (run (proc "nix" ["hash", "path", Text.unpack p]))
 
-nixHash_sha256Text :: Text -> IO NixHash
+nixHash_sha256Text :: Text -> IO (Either Text NixHash)
 nixHash_sha256Text t =
   Temp.withSystemTempFile "nixhell-hash" $ \fp h -> do
     ByteString.hPutStr h (Text.encodeUtf8 t)
     IO.hClose h
-    out <- readProcessStdout_ (proc "nix" ["hash", "file", fp])
-    pure $ NixHash $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
+    fmap (fmap NixHash) (run (proc "nix" ["hash", "file", fp]))
 
 nixHash_toText :: NixHash -> Text
 nixHash_toText (NixHash t) = t
@@ -316,14 +429,10 @@ nixExpr_toText = go
       $ Text.replace "\"" "\\\""
       $ Text.replace "\\" "\\\\" t
 
--- | Evaluate a NixExpr and return the result as a JSON Value.
-nixExpr_eval :: NixExpr -> IO Value
-nixExpr_eval expr = do
-  out <- readProcessStdout_
-    (proc "nix" ["eval", "--json", "--expr", Text.unpack (nixExpr_toText expr)])
-  case Json.decode out of
-    Nothing -> error "NixExpr.eval: nix returned invalid JSON"
-    Just v  -> pure v
+-- | Evaluate a NixExpr, returning the result as a JSON Value.
+nixExpr_eval :: NixExpr -> IO (Either Text Value)
+nixExpr_eval expr =
+  runJson (proc "nix" ["eval", "--json", "--expr", Text.unpack (nixExpr_toText expr)])
 
 --------------------------------------------------------------------------------
 -- DerivationSpec
@@ -342,32 +451,32 @@ derivationSpec_make name builder system args env outputs =
     }
 
 -- | Instantiate a DerivationSpec to a .drv file without building it.
-nix_mkDerivation :: DerivationSpec -> IO Derivation
+nix_mkDerivation :: DerivationSpec -> IO (Either Text Derivation)
 nix_mkDerivation ds = do
-  let expr = derivationSpecToNix ds
-  out <- readProcessStdout_
-    (proc "nix-instantiate" ["--expr", Text.unpack expr])
-  let t = Text.strip $ Text.decodeUtf8 $ L.toStrict out
-  case derivation_fromStorePath (StorePath t) of
-    Just drv -> pure drv
-    Nothing  ->
-      error $ "Nix.mkDerivation: result is not a .drv path: " <> Text.unpack t
+  r <- run (proc "nix-instantiate" ["--expr", Text.unpack (derivationSpecToNix ds)])
+  pure $ do
+    out <- r
+    case filter (not . Text.null) (Text.lines out) of
+      (t : _) ->
+        case derivation_fromStorePath (StorePath t) of
+          Just drv -> Right drv
+          Nothing  -> Left ("Nix.mkDerivation: result is not a .drv path: " <> t)
+      [] -> Left "Nix.mkDerivation: nix-instantiate produced no output"
 
 -- | Build a derivation, returning its output store paths keyed by output name.
-nix_realise :: Derivation -> IO (Map Text StorePath)
+nix_realise :: Derivation -> IO (Either Text (Map Text StorePath))
 nix_realise drv = do
-  out <- readProcessStdout_
+  r <- run
     (proc "nix-store"
       ["--realise", Text.unpack (storePath_toText (derivation_toStorePath drv))])
-  let paths = filter (not . Text.null)
-            $ Text.lines
-            $ Text.decodeUtf8
-            $ L.toStrict out
-  case paths of
-    [p] -> pure $ Map.singleton "out" (StorePath p)
-    ps  -> pure $ Map.fromList
-             $ zip (map (\i -> "out" <> Text.pack (show (i :: Int))) [0..])
-                   (map StorePath ps)
+  pure $ fmap toMap r
+  where
+    toMap out =
+      case filter (not . Text.null) (Text.lines out) of
+        [p] -> Map.singleton "out" (StorePath p)
+        ps  -> Map.fromList
+                 (zip (map (\i -> "out" <> Text.pack (show (i :: Int))) [0 ..])
+                      (map StorePath ps))
 
 -- | Internal: convert a DerivationSpec to a Nix derivation expression.
 --
@@ -408,34 +517,36 @@ derivationSpecToNix ds =
 --------------------------------------------------------------------------------
 -- FlakeGraph analysis
 
-nix_flakeGraph :: Text -> IO FlakeGraph
+nix_flakeGraph :: Text -> IO (Either Text FlakeGraph)
 nix_flakeGraph dir = do
-  v <- nix_flakeLock dir
-  pure $ case v of
-    Json.Object top ->
-      case Map.lookup "nodes" (KeyMap.toMapText top) of
-        Just (Json.Object nodes) ->
-          let nodeMap  = KeyMap.toMapText nodes
-              allNodes = filter (/= "root") $ Map.keys nodeMap
-              edges =
-                [ (parent, child)
-                | (parent, Json.Object node) <- Map.toList nodeMap
-                , parent /= "root"
-                , Just (Json.Object inputs) <-
-                    [Map.lookup "inputs" (KeyMap.toMapText node)]
-                , (_, Json.String child) <-
-                    Map.toList (KeyMap.toMapText inputs)
-                ]
-              urls = Map.fromList
-                [ (k, describeLockedNode (KeyMap.toMapText locked))
-                | (k, Json.Object node) <- Map.toList nodeMap
-                , k /= "root"
-                , Just (Json.Object locked) <-
-                    [Map.lookup "locked" (KeyMap.toMapText node)]
-                ]
-          in FlakeGraph { fg_nodes = allNodes, fg_edges = edges, fg_urls = urls }
-        _ -> FlakeGraph { fg_nodes = [], fg_edges = [], fg_urls = Map.empty }
-    _ -> FlakeGraph { fg_nodes = [], fg_edges = [], fg_urls = Map.empty }
+  r <- nix_flakeLock dir
+  pure $ fmap graphOf r
+  where
+    graphOf v = case v of
+      Json.Object top ->
+        case Map.lookup "nodes" (KeyMap.toMapText top) of
+          Just (Json.Object nodes) ->
+            let nodeMap  = KeyMap.toMapText nodes
+                allNodes = filter (/= "root") $ Map.keys nodeMap
+                edges =
+                  [ (parent, child)
+                  | (parent, Json.Object node) <- Map.toList nodeMap
+                  , parent /= "root"
+                  , Just (Json.Object inputs) <-
+                      [Map.lookup "inputs" (KeyMap.toMapText node)]
+                  , (_, Json.String child) <-
+                      Map.toList (KeyMap.toMapText inputs)
+                  ]
+                urls = Map.fromList
+                  [ (k, describeLockedNode (KeyMap.toMapText locked))
+                  | (k, Json.Object node) <- Map.toList nodeMap
+                  , k /= "root"
+                  , Just (Json.Object locked) <-
+                      [Map.lookup "locked" (KeyMap.toMapText node)]
+                  ]
+            in FlakeGraph { fg_nodes = allNodes, fg_edges = edges, fg_urls = urls }
+          _ -> FlakeGraph { fg_nodes = [], fg_edges = [], fg_urls = Map.empty }
+      _ -> FlakeGraph { fg_nodes = [], fg_edges = [], fg_urls = Map.empty }
 
 flakeGraph_nodes :: FlakeGraph -> [Text]
 flakeGraph_nodes = fg_nodes
@@ -478,6 +589,11 @@ flakeGraph_detectCycles fg =
 
 --------------------------------------------------------------------------------
 -- Cache: persistent KV store in ~/.cache/nix-hell/
+--
+-- Keys are hex-escaped so distinct keys never share a file (the old
+-- scheme mapped both '/' and ':' to '_', a collision, and permitted
+-- ".." as a filename). Writes are temp-file-plus-rename so concurrent
+-- readers never observe torn data.
 
 cacheDir :: IO FilePath
 cacheDir = do
@@ -487,16 +603,21 @@ cacheDir = do
   pure dir
 
 sanitizeKey :: Text -> String
-sanitizeKey = Text.unpack . Text.map safeChar
+sanitizeKey = Text.unpack . Text.concatMap enc
   where
-    safeChar '/' = '_'
-    safeChar ':' = '_'
-    safeChar c   = c
+    enc c
+      | isAscii c && isAlphaNum c = Text.singleton c
+      | c == '-'                  = Text.singleton c
+      | otherwise = "_" <> Text.pack (showHex (ord c) "") <> "_"
+
+cacheFile :: Text -> IO FilePath
+cacheFile key = do
+  dir <- cacheDir
+  pure (dir <> "/k-" <> sanitizeKey key)
 
 cache_get :: Text -> IO (Maybe Text)
 cache_get key = do
-  dir <- cacheDir
-  let fp = dir <> "/" <> sanitizeKey key
+  fp <- cacheFile key
   exists <- Dir.doesFileExist fp
   if exists
     then fmap (Just . Text.decodeUtf8) (ByteString.readFile fp)
@@ -505,8 +626,11 @@ cache_get key = do
 cache_set :: Text -> Text -> IO ()
 cache_set key val = do
   dir <- cacheDir
-  let fp = dir <> "/" <> sanitizeKey key
-  ByteString.writeFile fp (Text.encodeUtf8 val)
+  fp <- cacheFile key
+  (tmp, h) <- IO.openTempFile dir "write"
+  ByteString.hPutStr h (Text.encodeUtf8 val)
+  IO.hClose h
+  Dir.renameFile tmp fp
 
 cache_getOrRun :: Text -> IO Text -> IO Text
 cache_getOrRun key action = do
@@ -520,142 +644,119 @@ cache_getOrRun key action = do
 
 cache_invalidate :: Text -> IO ()
 cache_invalidate key = do
-  dir <- cacheDir
-  let fp = dir <> "/" <> sanitizeKey key
+  fp <- cacheFile key
   exists <- Dir.doesFileExist fp
   if exists then Dir.removeFile fp else pure ()
 
 --------------------------------------------------------------------------------
 -- Nix store operations
 
-nix_build :: Text -> IO StorePath
+nix_build :: Text -> IO (Either Text StorePath)
 nix_build attr = do
-  out <- readProcessStdout_
-    (proc "nix" ["build", "--no-link", "--print-out-paths", Text.unpack attr])
-  let paths = filter (not . Text.null)
-            $ Text.lines
-            $ Text.decodeUtf8
-            $ L.toStrict out
-  case paths of
-    (p:_) -> pure $ StorePath p
-    []    -> error $ "Nix.build: no output paths for " <> Text.unpack attr
+  r <- run (proc "nix" ["build", "--no-link", "--print-out-paths", Text.unpack attr])
+  pure $ do
+    out <- r
+    case filter (not . Text.null) (Text.lines out) of
+      (p : _) -> Right (StorePath p)
+      []      -> Left ("Nix.build: no output paths for " <> attr)
 
-nix_buildFlakeAttr :: Text -> Text -> IO StorePath
-nix_buildFlakeAttr flake attr =
-  nix_build (flake <> "#" <> attr)
+nix_buildFlakeAttr :: Text -> Text -> IO (Either Text StorePath)
+nix_buildFlakeAttr flake attr = nix_build (flake <> "#" <> attr)
 
-nix_eval :: Text -> IO Value
-nix_eval expr = do
-  out <- readProcessStdout_
-    (proc "nix" ["eval", "--json", "--expr", Text.unpack expr])
-  case Json.decode out of
-    Nothing -> error "Nix.eval: nix returned invalid JSON"
-    Just v  -> pure v
+nix_eval :: Text -> IO (Either Text Value)
+nix_eval expr =
+  runJson (proc "nix" ["eval", "--json", "--expr", Text.unpack expr])
 
-nix_evalFlakeAttr :: Text -> Text -> IO Value
-nix_evalFlakeAttr flake attr = do
-  out <- readProcessStdout_
-    (proc "nix" ["eval", "--json", Text.unpack (flake <> "#" <> attr)])
-  case Json.decode out of
-    Nothing -> error "Nix.evalFlakeAttr: nix returned invalid JSON"
-    Just v  -> pure v
+nix_evalFlakeAttr :: Text -> Text -> IO (Either Text Value)
+nix_evalFlakeAttr flake attr =
+  runJson (proc "nix" ["eval", "--json", Text.unpack (flake <> "#" <> attr)])
 
-nix_instantiate :: Text -> IO Derivation
+nix_instantiate :: Text -> IO (Either Text Derivation)
 nix_instantiate expr = do
-  out <- readProcessStdout_
-    (proc "nix-instantiate" ["--expr", Text.unpack expr])
-  let t = Text.strip $ Text.decodeUtf8 $ L.toStrict out
-  case derivation_fromStorePath (StorePath t) of
-    Just drv -> pure drv
-    Nothing  ->
-      error $ "Nix.instantiate: result is not a .drv path: " <> Text.unpack t
+  r <- run (proc "nix-instantiate" ["--expr", Text.unpack expr])
+  pure $ do
+    out <- r
+    case filter (not . Text.null) (Text.lines out) of
+      (t : _) ->
+        case derivation_fromStorePath (StorePath t) of
+          Just drv -> Right drv
+          Nothing  -> Left ("Nix.instantiate: result is not a .drv path: " <> t)
+      [] -> Left "Nix.instantiate: no output"
 
-nix_storeAdd :: Text -> ByteString -> IO StorePath
+nix_storeAdd :: Text -> ByteString -> IO (Either Text StorePath)
 nix_storeAdd name contents =
   Temp.withSystemTempFile (Text.unpack name) $ \fp h -> do
     ByteString.hPutStr h contents
     IO.hClose h
-    out <- readProcessStdout_
-      (proc "nix" ["store", "add-file", "--name", Text.unpack name, fp])
-    pure $ StorePath $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
+    r <- run (proc "nix" ["store", "add-file", "--name", Text.unpack name, fp])
+    pure (fmap StorePath r)
 
 nix_isInStore :: Text -> IO Bool
 nix_isInStore path = do
-  code <- runProcess (proc "nix" ["store", "ls", Text.unpack path])
+  code <- runProcess
+    (setStdout nullStream (setStderr nullStream
+      (proc "nix" ["store", "ls", Text.unpack path])))
   pure $ case code of
     ExitSuccess -> True
     _           -> False
 
-nix_queryRequisites :: StorePath -> IO [StorePath]
+nix_queryRequisites :: StorePath -> IO (Either Text [StorePath])
 nix_queryRequisites (StorePath p) = do
-  out <- readProcessStdout_
-    (proc "nix-store" ["--query", "--requisites", Text.unpack p])
-  pure
-    $ map StorePath
-    $ filter (not . Text.null)
-    $ Text.lines
-    $ Text.decodeUtf8
-    $ L.toStrict out
+  r <- run (proc "nix-store" ["--query", "--requisites", Text.unpack p])
+  pure $ fmap (map StorePath . filter (not . Text.null) . Text.lines) r
 
-nix_copy :: StorePath -> Text -> IO ()
+nix_copy :: StorePath -> Text -> IO (Either Text Text)
 nix_copy (StorePath p) dest =
-  runProcess_
-    (proc "nix" ["copy", "--to", Text.unpack dest, Text.unpack p])
+  run (proc "nix" ["copy", "--to", Text.unpack dest, Text.unpack p])
 
-nix_sign :: StorePath -> Text -> IO ()
+nix_sign :: StorePath -> Text -> IO (Either Text Text)
 nix_sign (StorePath p) keyFile =
-  runProcess_
-    (proc "nix" ["store", "sign",
-                 "--key-file", Text.unpack keyFile,
-                 Text.unpack p])
+  run (proc "nix" ["store", "sign", "--key-file", Text.unpack keyFile, Text.unpack p])
 
 --------------------------------------------------------------------------------
 -- Nix flake operations
 
-nix_flakeMetadata :: Text -> IO Value
-nix_flakeMetadata flake = do
-  out <- readProcessStdout_
-    (proc "nix" ["flake", "metadata", "--json", Text.unpack flake])
-  case Json.decode out of
-    Nothing -> error "Nix.flakeMetadata: invalid JSON"
-    Just v  -> pure v
+nix_flakeMetadata :: Text -> IO (Either Text Value)
+nix_flakeMetadata flake =
+  runJson (proc "nix" ["flake", "metadata", "--json", Text.unpack flake])
 
-nix_flakeUpdate :: Text -> IO ()
+nix_flakeUpdate :: Text -> IO (Either Text Text)
 nix_flakeUpdate dir =
-  runProcess_
-    (setWorkingDir (Text.unpack dir) (proc "nix" ["flake", "update"]))
+  run (setWorkingDir (Text.unpack dir) (proc "nix" ["flake", "update"]))
 
-nix_flakeLock :: Text -> IO Value
+nix_flakeLock :: Text -> IO (Either Text Value)
 nix_flakeLock dir = do
-  contents <- L.readFile (Text.unpack dir <> "/flake.lock")
-  case Json.decode contents of
-    Nothing -> error "Nix.flakeLock: could not parse flake.lock"
-    Just v  -> pure v
+  r <- try (L.readFile (Text.unpack dir <> "/flake.lock"))
+  pure $ case r of
+    Left (e :: IOException) ->
+      Left ("Nix.flakeLock: " <> tshow e)
+    Right contents ->
+      case Json.eitherDecode contents of
+        Left e  -> Left ("Nix.flakeLock: could not parse flake.lock: " <> Text.pack e)
+        Right v -> Right v
 
-nix_flakeInputs :: Text -> IO (Map Text Text)
+nix_flakeInputs :: Text -> IO (Either Text (Map Text Text))
 nix_flakeInputs dir = do
-  v <- nix_flakeLock dir
-  pure $ case v of
-    Json.Object top ->
-      case Map.lookup "nodes" (KeyMap.toMapText top) of
-        Just (Json.Object nodes) ->
-          Map.fromList
-            [ (k, describeLockedNode (KeyMap.toMapText locked))
-            | (k, Json.Object node) <- Map.toList (KeyMap.toMapText nodes)
-            , k /= "root"
-            , Just (Json.Object locked) <-
-                [Map.lookup "locked" (KeyMap.toMapText node)]
-            ]
-        _ -> Map.empty
-    _ -> Map.empty
+  r <- nix_flakeLock dir
+  pure $ fmap inputsOf r
+  where
+    inputsOf v = case v of
+      Json.Object top ->
+        case Map.lookup "nodes" (KeyMap.toMapText top) of
+          Just (Json.Object nodes) ->
+            Map.fromList
+              [ (k, describeLockedNode (KeyMap.toMapText locked))
+              | (k, Json.Object node) <- Map.toList (KeyMap.toMapText nodes)
+              , k /= "root"
+              , Just (Json.Object locked) <-
+                  [Map.lookup "locked" (KeyMap.toMapText node)]
+              ]
+          _ -> Map.empty
+      _ -> Map.empty
 
 nix_checkFlakeOutputs :: Text -> IO (Either Text Text)
-nix_checkFlakeOutputs dir = do
-  (code, _out, err) <- readProcess
-    (proc "nix" ["flake", "check", Text.unpack dir])
-  pure $ case code of
-    ExitSuccess   -> Right "flake check passed"
-    ExitFailure _ -> Left (Text.decodeUtf8 (L.toStrict err))
+nix_checkFlakeOutputs dir =
+  run (proc "nix" ["flake", "check", Text.unpack dir])
 
 describeLockedNode :: Map Text Json.Value -> Text
 describeLockedNode m =
@@ -678,25 +779,26 @@ describeLockedNode m =
 --------------------------------------------------------------------------------
 -- Profile and GC
 
-nix_profileInstall :: StorePath -> IO ()
+nix_profileInstall :: StorePath -> IO (Either Text Text)
 nix_profileInstall (StorePath p) =
-  runProcess_ (proc "nix" ["profile", "install", Text.unpack p])
+  run (proc "nix" ["profile", "install", Text.unpack p])
 
-nix_profileRemove :: Text -> IO ()
+nix_profileRemove :: Text -> IO (Either Text Text)
 nix_profileRemove name =
-  runProcess_ (proc "nix" ["profile", "remove", Text.unpack name])
+  run (proc "nix" ["profile", "remove", Text.unpack name])
 
-nix_profileList :: IO [StorePath]
+nix_profileList :: IO (Either Text [StorePath])
 nix_profileList = do
-  out <- readProcessStdout_ (proc "nix" ["profile", "list", "--json"])
-  case Json.decode out of
-    Just (Json.Object top) ->
-      case Map.lookup "elements" (KeyMap.toMapText top) of
-        Just (Json.Array elems) ->
-          pure $ concatMap extractStorePaths $ foldr (:) [] elems
-        _ -> pure []
-    _ -> pure []
+  r <- runJson (proc "nix" ["profile", "list", "--json"])
+  pure $ fmap pathsOf r
   where
+    pathsOf v = case v of
+      Json.Object top ->
+        case Map.lookup "elements" (KeyMap.toMapText top) of
+          Just (Json.Array elems) ->
+            concatMap extractStorePaths (foldr (:) [] elems)
+          _ -> []
+      _ -> []
     extractStorePaths :: Json.Value -> [StorePath]
     extractStorePaths (Json.Object m) =
       case Map.lookup "storePaths" (KeyMap.toMapText m) of
@@ -705,93 +807,98 @@ nix_profileList = do
         _ -> []
     extractStorePaths _ = []
 
-nix_gcCollect :: IO ()
-nix_gcCollect = runProcess_ (proc "nix-collect-garbage" [])
+nix_gcCollect :: IO (Either Text Text)
+nix_gcCollect = run (proc "nix-collect-garbage" [])
 
-nix_gcRoots :: IO [StorePath]
+nix_gcRoots :: IO (Either Text [StorePath])
 nix_gcRoots = do
-  out <- readProcessStdout_ (proc "nix-store" ["--gc", "--print-roots"])
-  pure
-    $ map (StorePath . Text.strip . takeLeft . Text.splitOn " -> ")
-    $ filter (not . Text.null)
-    $ Text.lines
-    $ Text.decodeUtf8
-    $ L.toStrict out
+  r <- run (proc "nix-store" ["--gc", "--print-roots"])
+  pure $ fmap rootsOf r
   where
-    takeLeft (x:_) = x
-    takeLeft []    = ""
+    rootsOf =
+      map (StorePath . Text.strip . takeLeft . Text.splitOn " -> ")
+      . filter (not . Text.null)
+      . Text.lines
+    takeLeft (x : _) = x
+    takeLeft []      = ""
 
-nix_addRoot :: StorePath -> Text -> IO ()
+nix_addRoot :: StorePath -> Text -> IO (Either Text Text)
 nix_addRoot (StorePath p) rootPath =
-  runProcess_
-    (proc "nix-store"
-      ["--add-root", Text.unpack rootPath, "--indirect",
-       "--realise", Text.unpack p])
+  run (proc "nix-store"
+    ["--add-root", Text.unpack rootPath, "--indirect",
+     "--realise", Text.unpack p])
 
-nix_optimiseStore :: IO ()
-nix_optimiseStore = runProcess_ (proc "nix" ["store", "optimise"])
+nix_optimiseStore :: IO (Either Text Text)
+nix_optimiseStore = run (proc "nix" ["store", "optimise"])
 
 --------------------------------------------------------------------------------
 -- Sops operations
 
-sops_get :: Text -> Text -> IO Secret
+sops_get :: Text -> Text -> IO (Either Text Secret)
 sops_get file key = do
-  out <- readProcessStdout_
-    (proc "sops" ["--decrypt", "--output-type", "json", Text.unpack file])
-  case Json.decode out of
-    Just (Json.Object m) ->
-      case Map.lookup key (KeyMap.toMapText m) of
-        Just (Json.String v) -> pure (Secret v)
-        _ -> error $ "Sops.get: key not found: " <> Text.unpack key
-    _ -> error "Sops.get: sops decrypt failed"
+  r <- runJson (proc "sops" ["--decrypt", "--output-type", "json", Text.unpack file])
+  pure $ do
+    v <- r
+    case v of
+      Json.Object m ->
+        case Map.lookup key (KeyMap.toMapText m) of
+          Just (Json.String s) -> Right (Secret s)
+          Just _  -> Left ("Sops.get: key is not a string: " <> key)
+          Nothing -> Left ("Sops.get: key not found: " <> key)
+      _ -> Left "Sops.get: sops output was not a JSON object"
 
-sops_getAll :: Text -> IO (Map Text Secret)
+sops_getAll :: Text -> IO (Either Text (Map Text Secret))
 sops_getAll file = do
-  out <- readProcessStdout_
-    (proc "sops" ["--decrypt", "--output-type", "json", Text.unpack file])
-  case Json.decode out of
-    Just (Json.Object m) ->
-      pure $ Map.fromList
-        [ (k, Secret v)
-        | (k, Json.String v) <- Map.toList (KeyMap.toMapText m)
-        ]
-    _ -> error "Sops.getAll: sops decrypt failed"
+  r <- runJson (proc "sops" ["--decrypt", "--output-type", "json", Text.unpack file])
+  pure $ do
+    v <- r
+    case v of
+      Json.Object m ->
+        Right $ Map.fromList
+          [ (k, Secret s)
+          | (k, Json.String s) <- Map.toList (KeyMap.toMapText m)
+          ]
+      _ -> Left "Sops.getAll: sops output was not a JSON object"
 
 --------------------------------------------------------------------------------
 -- Age operations
+--
+-- Armored (-a) so ciphertext is Text-safe and survives copy-paste,
+-- version control, and sops-style embedding.
 
-age_encrypt :: Text -> Text -> IO ByteString
+age_encrypt :: Text -> Text -> IO (Either Text Text)
 age_encrypt pubkey plaintext = do
   (code, out, err) <- readProcess
     (setStdin
       (byteStringInput (L.fromStrict (Text.encodeUtf8 plaintext)))
-      (proc "age" ["--encrypt", "--recipient", Text.unpack pubkey]))
-  case code of
-    ExitSuccess   -> pure (L.toStrict out)
-    ExitFailure _ ->
-      error $ "Age.encrypt failed: "
-           <> Text.unpack (Text.decodeUtf8 (L.toStrict err))
+      (proc "age" ["--encrypt", "--armor", "--recipient", Text.unpack pubkey]))
+  pure $ case code of
+    ExitSuccess   -> Right (decodeL out)
+    ExitFailure n ->
+      Left ("Age.encrypt: exit " <> tshow n <> ": " <> Text.strip (decodeL err))
 
-age_decrypt :: Text -> ByteString -> IO Secret
+age_decrypt :: Text -> Text -> IO (Either Text Secret)
 age_decrypt identityFile ciphertext = do
   (code, out, err) <- readProcess
     (setStdin
-      (byteStringInput (L.fromStrict ciphertext))
+      (byteStringInput (L.fromStrict (Text.encodeUtf8 ciphertext)))
       (proc "age" ["--decrypt", "--identity", Text.unpack identityFile]))
-  case code of
-    ExitSuccess   -> pure $ Secret $ Text.decodeUtf8 $ L.toStrict out
-    ExitFailure _ ->
-      error $ "Age.decrypt failed: "
-           <> Text.unpack (Text.decodeUtf8 (L.toStrict err))
+  pure $ case code of
+    ExitSuccess   -> Right (Secret (decodeL out))
+    ExitFailure n ->
+      Left ("Age.decrypt: exit " <> tshow n <> ": " <> Text.strip (decodeL err))
 
-ssh_toAge :: Text -> IO Text
-ssh_toAge pubkeyPath = do
-  out <- readProcessStdout_
-    (proc "ssh-to-age" ["-i", Text.unpack pubkeyPath])
-  pure $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
+ssh_toAge :: Text -> IO (Either Text Text)
+ssh_toAge pubkeyPath =
+  run (proc "ssh-to-age" ["-i", Text.unpack pubkeyPath])
 
 --------------------------------------------------------------------------------
 -- Shell safety
+--
+-- Note: Process.proc never invokes a shell, so escaping is NOT needed
+-- for local process invocation. These exist for the one legitimate
+-- case: constructing a command string to hand to a remote shell, e.g.
+-- ssh host "nix-store --realise <escaped>".
 
 shell_escape :: Text -> Text
 shell_escape t = "'" <> Text.replace "'" "'\\''" t <> "'"
@@ -799,17 +906,18 @@ shell_escape t = "'" <> Text.replace "'" "'\\''" t <> "'"
 shell_escapeList :: [Text] -> Text
 shell_escapeList ts = Text.intercalate " " (map shell_escape ts)
 
-shell_which :: Text -> IO (Maybe StorePath)
+-- | The old version returned StorePath, which was a lie: `which` output
+-- is only a store path on a pure-NixOS PATH. Returns the raw path;
+-- validate with StorePath.fromText if you need the invariant.
+shell_which :: Text -> IO (Maybe Text)
 shell_which cmd = do
-  (code, out, _err) <- readProcess (proc "which" [Text.unpack cmd])
-  pure $ case code of
-    ExitSuccess ->
-      Just $ StorePath $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
-    _ -> Nothing
+  r <- run (proc "which" [Text.unpack cmd])
+  pure $ either (const Nothing) Just r
 
 shell_inPath :: Text -> IO Bool
 shell_inPath cmd = do
-  code <- runProcess (proc "which" [Text.unpack cmd])
+  code <- runProcess
+    (setStdout nullStream (setStderr nullStream (proc "which" [Text.unpack cmd])))
   pure $ case code of
     ExitSuccess -> True
     _           -> False
@@ -817,53 +925,59 @@ shell_inPath cmd = do
 --------------------------------------------------------------------------------
 -- NixOS operations
 
+-- | Streams output to the terminal; returns the exit code. Kept as
+-- ExitCode rather than Either because rebuild output is interactive
+-- and you want to see it live.
 nixos_rebuild :: Text -> IO ExitCode
 nixos_rebuild action =
   runProcess (proc "nixos-rebuild" [Text.unpack action])
 
-nixos_currentSystem :: IO StorePath
+nixos_currentSystem :: IO (Either Text StorePath)
 nixos_currentSystem = do
-  out <- readProcessStdout_ (proc "readlink" ["-f", "/run/current-system"])
-  pure $ StorePath $ Text.strip $ Text.decodeUtf8 $ L.toStrict out
+  r <- run (proc "readlink" ["-f", "/run/current-system"])
+  pure (fmap StorePath r)
 
--- | Evaluate a NixOS option via the flake-based system configuration.
--- Reads the hostname to select the right nixosConfigurations entry,
--- then calls nix eval --json on the resulting attribute path.
-nixos_option :: Text -> IO Value
-nixos_option option = do
-  hostname <- fmap (Text.strip . Text.decodeUtf8 . L.toStrict)
-                (readProcessStdout_ (proc "hostname" []))
-  let expr = Text.unpack $ Text.concat
-               [ "(builtins.getFlake \"/etc/nixos\")"
-               , ".nixosConfigurations."
-               , hostname
-               , ".config."
-               , option
-               ]
-  out <- readProcessStdout_
-    (proc "nix" ["eval", "--json", "--impure", "--expr", expr])
-  case Json.decode out of
-    Nothing -> error $ "NixOS.option: invalid JSON for " <> Text.unpack option
-    Just v  -> pure v
+-- | Evaluate a NixOS option from a flake-based system configuration.
+-- Takes the flake dir explicitly (the old version hardcoded /etc/nixos)
+-- and evaluates purely via the attrpath (the old version used --impure
+-- with builtins.getFlake). Impure evaluation failures become Left.
+nixos_option :: Text -> Text -> IO (Either Text Value)
+nixos_option flakeDir option = do
+  hr <- run (proc "hostname" [])
+  case hr of
+    Left e -> pure (Left e)
+    Right hostname ->
+      runJson
+        (proc "nix"
+          [ "eval", "--json"
+          , Text.unpack
+              (flakeDir <> "#nixosConfigurations." <> hostname
+                        <> ".config." <> option)
+          ])
 
-nixos_generations :: IO Text
+nixos_generations :: IO (Either Text Text)
 nixos_generations = do
-  entries <- Dir.listDirectory "/nix/var/nix/profiles"
-  let gens = filter (Text.isPrefixOf "system-" . Text.pack) entries
-  pure $ Text.unlines $ map Text.pack $ foldr (:) [] gens
+  r <- try (Dir.listDirectory "/nix/var/nix/profiles")
+  pure $ case r of
+    Left (e :: IOException) -> Left ("NixOS.generations: " <> tshow e)
+    Right entries ->
+      Right $ Text.unlines
+        [ t | e <- entries, let t = Text.pack e, Text.isPrefixOf "system-" t ]
 
-nixos_rollback :: IO ()
-nixos_rollback =
-  runProcess_ (proc "nixos-rebuild" ["--rollback", "switch"])
+nixos_rollback :: IO (Either Text Text)
+nixos_rollback = run (proc "nixos-rebuild" ["--rollback", "switch"])
 
 --------------------------------------------------------------------------------
 -- Systemd operations
+--
+-- status/logs capture output regardless of exit code (systemctl status
+-- exits 3 for inactive units, which is information, not failure).
 
 systemd_status :: Text -> IO Text
 systemd_status unit = do
   (_code, out, _err) <-
     readProcess (proc "systemctl" ["status", Text.unpack unit])
-  pure $ Text.decodeUtf8 $ L.toStrict out
+  pure (decodeL out)
 
 systemd_start :: Text -> IO ExitCode
 systemd_start unit =
@@ -879,6 +993,163 @@ systemd_restart unit =
 
 systemd_logs :: Text -> IO Text
 systemd_logs unit = do
-  out <- readProcessStdout_
-    (proc "journalctl" ["-u", Text.unpack unit, "--no-pager"])
-  pure $ Text.decodeUtf8 $ L.toStrict out
+  (_code, out, _err) <-
+    readProcess (proc "journalctl" ["-u", Text.unpack unit, "--no-pager"])
+  pure (decodeL out)
+
+--------------------------------------------------------------------------------
+-- Registration lists: the entire integration surface with Hell.hs
+--
+-- Hell.hs splices these into its three tables. Adding a primitive or
+-- type means editing this section only; upstream rebases never touch
+-- NixHell code paths in Hell.hs beyond three one-line splices.
+
+-- | Guest-visible type constructors.
+nixTypes :: [(String, SomeTypeRep)]
+nixTypes =
+  [ ("StorePath",      SomeTypeRep (typeRep @StorePath))
+  , ("Secret",         SomeTypeRep (typeRep @Secret))
+  , ("NixHash",        SomeTypeRep (typeRep @NixHash))
+  , ("Derivation",     SomeTypeRep (typeRep @Derivation))
+  , ("Flake",          SomeTypeRep (typeRep @Flake))
+  , ("NixExpr",        SomeTypeRep (typeRep @NixExpr))
+  , ("DerivationSpec", SomeTypeRep (typeRep @DerivationSpec))
+  , ("FlakeGraph",     SomeTypeRep (typeRep @FlakeGraph))
+  ]
+
+-- | Monomorphic instance dictionaries for guest-visible constraints.
+-- Only plain instances live here; containers of NixHell types resolve
+-- through Hell's entailment machinery recursing into these.
+nixInstances :: [((SomeTypeRep, SomeTypeRep), Dynamic)]
+nixInstances =
+  [ inst0 @Show @StorePath
+  , inst0 @Eq   @StorePath
+  , inst0 @Ord  @StorePath
+  , inst0 @Show @NixHash
+  , inst0 @Eq   @NixHash
+  , inst0 @Ord  @NixHash
+  , inst0 @Show @Derivation
+  , inst0 @Eq   @Derivation
+  , inst0 @Ord  @Derivation
+  , inst0 @Show @Flake
+  , inst0 @Eq   @Flake
+  , inst0 @Ord  @Flake
+  , inst0 @Show @NixExpr
+  , inst0 @Eq   @NixExpr
+  , inst0 @Ord  @NixExpr
+  , inst0 @Show @DerivationSpec
+  , inst0 @Eq   @DerivationSpec
+  , inst0 @Show @FlakeGraph
+  , inst0 @Eq   @FlakeGraph
+  ]
+  where
+    inst0 ::
+      forall (cls :: Type -> Constraint) a.
+      (cls a, Typeable cls, Typeable a) =>
+      ((SomeTypeRep, SomeTypeRep), Dynamic)
+    inst0 =
+      ( (SomeTypeRep (typeRep @cls), SomeTypeRep (typeRep @a))
+      , toDyn (Dict @(cls a))
+      )
+
+-- | Guest-visible primitives as (name, Dynamic). Hell.hs unwraps the
+-- Dynamic into (TypeRep a, a) and registers it as a literal.
+nixLits :: [(String, Dynamic)]
+nixLits =
+  [ -- StorePath
+    l "StorePath.fromText"       storePath_fromText
+  , l "StorePath.toText"         storePath_toText
+    -- Secret
+  , l "Secret.expose"            secret_expose
+  , l "Secret.setEnv"            secret_setEnv
+  , l "Secret.writeFile"         secret_writeFile
+    -- NixHash
+  , l "NixHash.sha256Path"       nixHash_sha256Path
+  , l "NixHash.sha256Text"       nixHash_sha256Text
+  , l "NixHash.toText"           nixHash_toText
+    -- Derivation
+  , l "Derivation.fromStorePath" derivation_fromStorePath
+  , l "Derivation.toStorePath"   derivation_toStorePath
+    -- Flake
+  , l "Flake.fromText"           flake_fromText
+  , l "Flake.toText"             flake_toText
+    -- NixExpr
+  , l "NixExpr.str"              nixExpr_str
+  , l "NixExpr.int"              nixExpr_int
+  , l "NixExpr.bool"             nixExpr_bool
+  , l "NixExpr.true"             nixExpr_true
+  , l "NixExpr.false"            nixExpr_false
+  , l "NixExpr.null"             nixExpr_null
+  , l "NixExpr.list"             nixExpr_list
+  , l "NixExpr.attrs"            nixExpr_attrs
+  , l "NixExpr.path"             nixExpr_path
+  , l "NixExpr.toText"           nixExpr_toText
+  , l "NixExpr.eval"             nixExpr_eval
+    -- DerivationSpec
+  , l "DerivationSpec.make"      derivationSpec_make
+  , l "Nix.mkDerivation"         nix_mkDerivation
+  , l "Nix.realise"              nix_realise
+    -- FlakeGraph
+  , l "Nix.flakeGraph"           nix_flakeGraph
+  , l "FlakeGraph.nodes"         flakeGraph_nodes
+  , l "FlakeGraph.edges"         flakeGraph_edges
+  , l "FlakeGraph.urls"          flakeGraph_urls
+  , l "FlakeGraph.detectCycles"  flakeGraph_detectCycles
+    -- Cache
+  , l "Cache.get"                cache_get
+  , l "Cache.set"                cache_set
+  , l "Cache.getOrRun"           cache_getOrRun
+  , l "Cache.invalidate"         cache_invalidate
+    -- Nix store
+  , l "Nix.build"                nix_build
+  , l "Nix.buildFlakeAttr"       nix_buildFlakeAttr
+  , l "Nix.storeAdd"             nix_storeAdd
+  , l "Nix.isInStore"            nix_isInStore
+  , l "Nix.queryRequisites"      nix_queryRequisites
+  , l "Nix.copy"                 nix_copy
+  , l "Nix.sign"                 nix_sign
+    -- Nix eval and flake
+  , l "Nix.eval"                 nix_eval
+  , l "Nix.evalFlakeAttr"        nix_evalFlakeAttr
+  , l "Nix.instantiate"          nix_instantiate
+  , l "Nix.flakeMetadata"        nix_flakeMetadata
+  , l "Nix.flakeUpdate"          nix_flakeUpdate
+  , l "Nix.flakeLock"            nix_flakeLock
+  , l "Nix.flakeInputs"          nix_flakeInputs
+  , l "Nix.checkFlakeOutputs"    nix_checkFlakeOutputs
+    -- Profile and GC
+  , l "Nix.profileInstall"       nix_profileInstall
+  , l "Nix.profileRemove"        nix_profileRemove
+  , l "Nix.profileList"          nix_profileList
+  , l "Nix.gcCollect"            nix_gcCollect
+  , l "Nix.gcRoots"              nix_gcRoots
+  , l "Nix.addRoot"              nix_addRoot
+  , l "Nix.optimiseStore"        nix_optimiseStore
+    -- Sops
+  , l "Sops.get"                 sops_get
+  , l "Sops.getAll"              sops_getAll
+    -- Age
+  , l "Age.encrypt"              age_encrypt
+  , l "Age.decrypt"              age_decrypt
+  , l "Ssh.toAge"                ssh_toAge
+    -- Shell
+  , l "Shell.escape"             shell_escape
+  , l "Shell.escapeList"         shell_escapeList
+  , l "Shell.which"              shell_which
+  , l "Shell.inPath"             shell_inPath
+    -- NixOS
+  , l "NixOS.rebuild"            nixos_rebuild
+  , l "NixOS.currentSystem"      nixos_currentSystem
+  , l "NixOS.option"             nixos_option
+  , l "NixOS.generations"        nixos_generations
+  , l "NixOS.rollback"           nixos_rollback
+    -- Systemd
+  , l "Systemd.status"           systemd_status
+  , l "Systemd.start"            systemd_start
+  , l "Systemd.stop"             systemd_stop
+  , l "Systemd.restart"          systemd_restart
+  , l "Systemd.logs"             systemd_logs
+  ]
+  where
+    l :: forall a. (Typeable a) => String -> a -> (String, Dynamic)
+    l name x = (name, toDyn x)
