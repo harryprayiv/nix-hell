@@ -5,7 +5,15 @@
 -- curated runnable subset sequentially with per-script timing.
 -- Optional groups are off by default; enable with switches.
 --
---   nix-hell scripts/test-all.hell --bin ./result/bin/nix-hell --slow --nixos
+-- The --sops and --age gates are hermetic: fixtures are validated by
+-- an actual decrypt probe and auto-provisioned via
+-- scripts/setup-fixtures.hell when missing or stale, and
+-- SOPS_AGE_KEY_FILE is injected into the sops tests by the runner.
+-- Consequence: secrets/example.yaml, test.pub, and /tmp/test.key are
+-- OWNED BY THIS SUITE and may be overwritten. Never point real
+-- secrets at those paths.
+--
+--   nix-hell scripts/test-all.hell --bin ./result/bin/nix-hell --slow --sops --age
 
 data Opts = Opts {
   bin :: Text, dir :: Text,
@@ -19,11 +27,34 @@ options =
     <$> Options.strOption (Option.long "bin" <> Option.value "nix-hell" <> Option.help "nix-hell binary to test")
     <*> Options.strOption (Option.long "dir" <> Option.value "examples" <> Option.help "examples directory")
     <*> Options.switch (Flag.long "slow" <> Flag.help "run examples that invoke nix build")
-    <*> Options.switch (Flag.long "sops" <> Flag.help "run examples needing secrets/example.yaml")
-    <*> Options.switch (Flag.long "age" <> Flag.help "run examples needing test.pub and /tmp/test.key")
+    <*> Options.switch (Flag.long "sops" <> Flag.help "run sops examples (fixture auto-provisioned)")
+    <*> Options.switch (Flag.long "age" <> Flag.help "run age examples (fixture auto-provisioned)")
     <*> Options.switch (Flag.long "sudo" <> Flag.help "run examples needing privileged systemctl")
     <*> Options.switch (Flag.long "nixos" <> Flag.help "run NixOS-only examples")
     <*> Options.switch (Flag.long "net" <> Flag.help "run examples needing external network")
+
+-- True when secrets/example.yaml exists AND decrypts with
+-- /tmp/test.key. A grep for metadata would accept a fixture encrypted
+-- to a dead key; only a real decrypt proves the fixture is usable.
+fixtureValid = do
+  fixtureExists <- Directory.doesFileExist "secrets/example.yaml"
+  if Bool.not fixtureExists
+    then IO.pure Bool.False
+    else do
+      keyExists <- Directory.doesFileExist "/tmp/test.key"
+      if Bool.not keyExists
+        then IO.pure Bool.False
+        else do
+          env <- Environment.getEnvironment
+          (code, out, err) <- Text.readProcess
+            (Process.setEnv (List.cons ("SOPS_AGE_KEY_FILE", "/tmp/test.key") env)
+              (Process.proc "sops" ["--decrypt", "--output-type", "json", "secrets/example.yaml"]))
+          IO.pure (Eq.eq code Exit.ExitSuccess)
+
+ageKeysValid = do
+  k <- Directory.doesFileExist "/tmp/test.key"
+  p <- Directory.doesFileExist "test.pub"
+  IO.pure (List.and [k, p])
 
 main = do
   opts <- Options.execParser (Options.info (Main.options <**> Options.helper) Options.fullDesc)
@@ -35,6 +66,21 @@ main = do
   let sudo = Record.get @"sudo" @Bool opts
   let nixos = Record.get @"nixos" @Bool opts
   let net = Record.get @"net" @Bool opts
+
+  -- Phase 0: fixture provisioning for the hermetic gates.
+  needSops <- if sops
+    then Functor.fmap Bool.not Main.fixtureValid
+    else IO.pure Bool.False
+  needAge <- if age
+    then Functor.fmap Bool.not Main.ageKeysValid
+    else IO.pure Bool.False
+  Monad.when (List.or [needSops, needAge]) do
+    Text.putStrLn "=== phase 0: provisioning fixtures ==="
+    Process.runProcess_ (Process.proc bin ["scripts/setup-fixtures.hell"])
+    Monad.when sops do
+      ok <- Main.fixtureValid
+      Monad.when (Bool.not ok)
+        (Exit.die "fixture provisioning ran but decrypt probe still fails; check .sops.yaml creation rules")
 
   -- Phase 1: every .hell file in the directory must typecheck.
   Text.putStrLn "=== phase 1: typecheck ==="
@@ -59,6 +105,8 @@ main = do
   -- of these hit the nix store and stampeding builds helps nobody.
   Text.putStrLn ""
   Text.putStrLn "=== phase 2: run ==="
+  let sopsEnvFiles = ["47-secret-usage.hell", "58-sops-getall.hell"]
+  baseEnv <- Environment.getEnvironment
   let runs =
         [ ("01-hello-world.hell",        [], Bool.True,  "")
         , ("02-interaction.hell",        [], Bool.False, "stdin")
@@ -136,8 +184,13 @@ main = do
       else do
         Text.putStr ("  run         " <> f <> " ... ")
         t0 <- UTCTime.getCurrentTime
-        (code, out, err) <- Text.readProcess
-          (Process.proc bin (List.cons (dir <> "/" <> f) extraArgs))
+        let baseCfg = Process.proc bin (List.cons (dir <> "/" <> f) extraArgs)
+        let cfg = if List.elem f sopsEnvFiles
+              then Process.setEnv
+                     (List.cons ("SOPS_AGE_KEY_FILE", "/tmp/test.key") baseEnv)
+                     baseCfg
+              else baseCfg
+        (code, out, err) <- Text.readProcess cfg
         t1 <- UTCTime.getCurrentTime
         let secs = UTCTime.diffUTCTime t1 t0
         case code of

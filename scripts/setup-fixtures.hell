@@ -1,0 +1,71 @@
+#!/usr/bin/env nix-hell
+-- scripts/setup-fixtures.hell
+--
+-- Creates the fixtures the --age and --sops gates need, verifying
+-- every step. Ciphertext is captured before the fixture file is
+-- touched (Text.readProcessStdout_ throws on nonzero exit), so a
+-- failed encrypt cannot leave a truncated secrets/example.yaml
+-- behind, and the fixture is decrypt-verified before this script
+-- reports success.
+--
+-- The encrypt runs with its working directory set to a temp dir.
+-- This is load-bearing: sops discovers .sops.yaml by walking up from
+-- the CWD, and a discovered config demands a matching creation rule
+-- even when --age is passed explicitly. Encrypting from inside the
+-- repo therefore fails with "no matching creation rules found"
+-- whenever the repo (or an ancestor) carries a .sops.yaml whose
+-- path_regex doesn't cover the temp file. Running from /tmp finds no
+-- config, so the --age flag governs. Decryption never consults
+-- creation rules, so the suite can decrypt from repo root as usual.
+
+main = do
+  -- 1. age identity at /tmp/test.key (reused if already present)
+  keyExists <- Directory.doesFileExist "/tmp/test.key"
+  Monad.when (Bool.not keyExists)
+    (Process.runProcess_ (Process.proc "age-keygen" ["-o", "/tmp/test.key"]))
+
+  -- 2. public key to ./test.pub, derived from the identity with -y,
+  -- never hand-copied. The "Public key: age1..." banner from
+  -- age-keygen -o is a trap: copying it puts the prefix in the file
+  -- and every encrypt after that fails on a malformed recipient.
+  pub0 <- Text.readProcessStdout_ (Process.proc "age-keygen" ["-y", "/tmp/test.key"])
+  let pub = Text.strip pub0
+  Text.writeFile "test.pub" pub
+  Text.putStrLn ("test.pub: " <> pub)
+
+  -- 3. sops fixture at secrets/example.yaml. Absolute input path plus
+  -- temp-dir CWD; input/output types explicit so nothing depends on
+  -- sops guessing from an extension.
+  Directory.createDirectoryIfMissing Bool.True "secrets"
+  Temp.withSystemTempDirectory "nix-hell-fixture" \tmpDir -> do
+    let plainFp = tmpDir <> "/plain.yaml"
+    Text.writeFile plainFp "db_password: hunter2\napi_key: abc123\n"
+    ct <- Text.readProcessStdout_
+      $ Process.setWorkingDir tmpDir
+      $ Process.proc "sops"
+          [ "--encrypt"
+          , "--input-type", "yaml"
+          , "--output-type", "yaml"
+          , "--age", pub
+          , plainFp
+          ]
+    if Text.isInfixOf "sops" ct
+      then do
+        Text.writeFile "secrets/example.yaml" ct
+        Text.putStrLn "wrote secrets/example.yaml"
+      else Exit.die "FAIL: sops exited zero but output has no metadata; not writing fixture"
+
+  -- 4. verify the fixture decrypts with the exact command, env shape,
+  -- and repo-root CWD the test suite will use.
+  env <- Environment.getEnvironment
+  (code, out, err) <- Text.readProcess
+    (Process.setEnv (List.cons ("SOPS_AGE_KEY_FILE", "/tmp/test.key") env)
+      (Process.proc "sops" ["--decrypt", "--output-type", "json", "secrets/example.yaml"]))
+  case code of
+    Exit.ExitFailure i ->
+      Exit.die (Text.concat
+        ["FAIL: fixture written but decrypt exited ", Show.show i, ": ", Text.strip err])
+    Exit.ExitSuccess ->
+      if Text.isInfixOf "hunter2" out
+        then Text.putStrLn "PASS: fixture decrypts and contains db_password"
+        else Exit.die ("FAIL: decrypted but db_password missing: " <> out)
