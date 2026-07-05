@@ -1,6 +1,9 @@
 #!/usr/bin/env nix-hell
 -- examples/64-cache.hell
 -- Cache API unchanged; the inner build now goes through Either.
+-- Note: Hell's case does not support tuple patterns or literal
+-- patterns in alternatives, so the collision assertion uses
+-- Maybe.maybe folds instead.
 main = do
   Text.putStrLn "computing (or loading from cache)..."
   result <- Cache.getOrRun "nixpkgs-hello-path" do
@@ -20,14 +23,18 @@ main = do
   Cache.set "a:b" "colon"
   x <- Cache.get "a/b"
   y <- Cache.get "a:b"
-  case (x, y) of
-    (Maybe.Just "slash", Maybe.Just "colon") ->
-      Text.putStrLn "PASS: a/b and a:b are distinct cache keys"
-    (p, q) -> Exit.die "FAIL: cache key collision"
+  let slashOk = Maybe.maybe Bool.False (Eq.eq "slash") x
+  let colonOk = Maybe.maybe Bool.False (Eq.eq "colon") y
 
+  -- Clean up before asserting, so a failing run leaves no litter.
   Cache.invalidate "my-timestamp"
   Cache.invalidate "a/b"
   Cache.invalidate "a:b"
+
+  if List.and [slashOk, colonOk]
+    then Text.putStrLn "PASS: a/b and a:b are distinct cache keys"
+    else Exit.die "FAIL: cache key collision"
+
   after <- Cache.get "my-timestamp"
   case after of
     Maybe.Nothing -> Text.putStrLn "PASS: invalidation worked"
