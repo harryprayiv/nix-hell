@@ -41,7 +41,7 @@
 {-# OPTIONS_GHC -Wno-unused-foralls #-}
 
 module Main (main, specMain) where
-  
+
 #if __GLASGOW_HASKELL__ >= 906
 import Control.Monad
 #endif
@@ -50,6 +50,13 @@ import Control.Monad
 -- e.g. 'Data.Graph' becomes 'Graph', and are then exposed to the Hell
 -- guest language as such.
 
+import qualified Data.CaseInsensitive as CI
+import Data.CaseInsensitive (CI, FoldCase)
+import qualified Network.HTTP.Types as Http
+import qualified Network.Wai as Wai
+import qualified Network.Wai.Handler.Warp as Warp
+import Data.ByteString.Builder (Builder)
+import qualified Data.ByteString.Builder as Builder
 import Control.Applicative (Alternative (..), optional)
 import qualified Control.Concurrent as Concurrent
 import Control.Exception (evaluate)
@@ -88,7 +95,7 @@ import qualified Data.Text.Encoding as Text
 import qualified Data.Text.IO as Text
 import Data.These (These)
 import qualified Data.These as These
-import Data.Time (Day, TimeOfDay, UTCTime)
+import Data.Time (Day, TimeOfDay, UTCTime, DayOfWeek)
 import qualified Data.Time as Time
 import qualified Data.Time.Format.ISO8601 as Time
 import Data.Traversable
@@ -165,7 +172,7 @@ commandParser =
 
 -- | Version of Hell.
 hellVersion :: Text
-hellVersion = "2025-11-11"
+hellVersion = "2026-05-29-nix"
 
 -- | Dispatch on the command.
 dispatch :: Command -> IO ()
@@ -727,7 +734,6 @@ tc (UForall _ forallLoc _ _ fall _ _ reps0) _env = go reps0 fall
     go [] (Term typed') = pure typed'
     go (SomeTypeRep rep : reps) (Forall sym f)
       | Just Type.HRefl <- Type.eqTypeRep (typeRepKind rep) sym = go reps (f rep)
-    -- Cases that look like: Monad (Either (a :: Type) :: Type -> Type)
     go reps (ClassConstraint rep crep f) =
       withClassConstraint forallLoc reps rep crep f go
     go reps fa@(GetOf k0 a0 t0 r0 f) =
@@ -769,30 +775,9 @@ withClassConstraint ::
   ([SomeTypeRep] -> Forall -> Either TypeCheckError (Typed (Term g))) ->
   Either TypeCheckError (Typed (Term g))
 withClassConstraint forallLoc reps rep crep f go =
-  if
-      -- Cases that look like: Semigroup (Vector (e :: *))
-      -- Note: the kinds are limited to this exact specification in the signature above.
-      | Type.App t _ <- rep,
-        Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @(Type -> Type)),
-        Just dict <- resolve1 (Type.App crep rep) crep t instances ->
-          go reps (withDict dict f)
-      -- Cases that look like: Monad (Either (e :: *) (a :: *))
-      -- Note: the kinds are limited to this exact specification in the signature above.
-      | Type.App t _ <- rep,
-        Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @(Type -> Type -> Type)),
-        Just dict <- resolve1 (Type.App crep rep) crep t instances ->
-          go reps (withDict dict f)
-      -- Cases that look like: Semigroup (Mod (f :: * -> *) (a :: *))
-      -- Note: the kinds are limited to this exact specification in the signature above.
-      | Type.App (Type.App t _a) _b <- rep,
-        Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @((Type -> Type) -> Type -> Type)),
-        Just dict <- resolve2 (Type.App crep rep) crep t instances ->
-          go reps (withDict dict f)
-      -- Simple cases: Eq (a :: k)
-      | Just dict <- resolve crep rep instances ->
-          go reps (withDict dict f)
-      | otherwise ->
-          problem $
+  case lookupDict rep crep of
+    Just dict -> go reps (withDict dict f)
+    Nothing -> problem $
             "type "
               ++ show rep
               ++ " doesn't appear to be an instance of "
@@ -801,22 +786,75 @@ withClassConstraint forallLoc reps rep crep f go =
     problem :: forall x. String -> Either TypeCheckError x
     problem = Left . ConstraintResolutionProblem forallLoc (ClassConstraint rep crep f)
 
+-- The workhorse behind withClassConstraint. See documentation there.
+lookupDict ::
+  forall g k (c :: k -> Constraint) (a :: k).
+  TypeRep a ->
+  TypeRep c ->
+  Maybe (Dict (c a))
+lookupDict rep crep =
+  if
+   -- Cases that look like: Semigroup (Vector (e :: *))
+   -- Note: the kinds are limited to this exact specification in the signature above.
+   | Type.App t _ <- rep,
+     Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @(Type -> Type)),
+     Just dict <- resolve1 (Type.App crep rep) crep t instances ->
+       pure dict
+   -- Cases that look like: Eq (Either (e :: *) (a :: *))
+   -- Note: the kinds are limited to this exact specification in the signature above.
+   | Type.App (Type.App t _) _ <- rep,
+     Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @(Type -> Type -> Type)),
+     Just dict <- resolve2 (Type.App crep rep) crep t instances ->
+       pure dict
+   -- Cases that look like: Monad (Either (e :: *))
+   -- Note: the kinds are limited to this exact specification in the signature above.
+   | Type.App t _ <- rep,
+     Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @(Type -> Type -> Type)),
+     Just dict <- resolve1 (Type.App crep rep) crep t instances ->
+       pure dict
+   -- Cases that look like: Semigroup (Mod (f :: * -> *) (a :: *))
+   -- Note: the kinds are limited to this exact specification in the signature above.
+   | Type.App (Type.App t _a) _b <- rep,
+     Just Type.HRefl <- Type.eqTypeRep (typeRepKind t) (TypeRep @((Type -> Type) -> Type -> Type)),
+     Just dict <- resolve2 (Type.App crep rep) crep t instances ->
+       pure dict
+   -- Simple cases: Eq (a :: k)
+   | otherwise ->
+       resolve crep rep instances
+
 --------------------------------------------------------------------------------
 -- Instances
 
+-- Dict but for (t :: * -> *), like Monad []
 newtype D1 c t = D1 (forall e. Dict (c (t e)))
 
+-- Dict but for (t :: * -> * -> *), like Monad (Either e)
 newtype D2 c t = D2 (forall f a. Dict (c (t f a)))
 
-newtype Instances = Instances (Map (SomeTypeRep, SomeTypeRep) Dynamic)
+-- Entailment, c a => c (t a), E.g. Eq a :- Eq [a]
+newtype ED1 c t = ED1 (forall e. c e :- c (t e))
+
+-- Entailment, (c a, c b) => c (t a b), E.g. (Eq a, Eq b) :- Eq (Either a b)
+newtype ED2 c t = ED2 (forall e f. (c e, c f) :- c (t e f))
+
+newtype Instances = Instances {getInstances ::Map (SomeTypeRep, SomeTypeRep) Dynamic}
 
 instances :: Instances
 instances =
   Instances $
     Map.fromList
-      [ instance0 @Show @Int,
+      [ entail1 @Show @[],
+        entail1 @Show @Set,
+        entail1 @Show @CI,
+        entail1 @Show @Tree,
+        entail1 @Show @Maybe,
+        entail1 @Show @Vector,
+        entail2 @Show @Either,
+        entail2 @Show @(,),
+        instance0 @Show @Int,
         instance0 @Show @Integer,
         instance0 @Show @Day,
+        instance0 @Show @DayOfWeek,
         instance0 @Show @UTCTime,
         instance0 @Show @TimeOfDay,
         instance0 @Show @Double,
@@ -824,28 +862,21 @@ instances =
         instance0 @Show @Char,
         instance0 @Show @Text,
         instance0 @Show @ByteString,
+        instance0 @Show @Builder,
         instance0 @Show @ExitCode,
-        instance0 @Show @NixHell.StorePath,
-        instance0 @Eq   @NixHell.StorePath,
-        instance0 @Ord  @NixHell.StorePath,
-        instance0 @Show @NixHell.NixHash,
-        instance0 @Eq   @NixHell.NixHash,
-        instance0 @Ord  @NixHell.NixHash,
-        instance0 @Show @NixHell.Derivation,
-        instance0 @Eq   @NixHell.Derivation,
-        instance0 @Ord  @NixHell.Derivation,
-        instance0 @Show @NixHell.Flake,
-        instance0 @Eq   @NixHell.Flake,
-        -- Phase 2
-        instance0 @Show @NixHell.NixExpr,
-        instance0 @Eq   @NixHell.NixExpr,
-        instance0 @Show @NixHell.DerivationSpec,
-        instance0 @Eq   @NixHell.DerivationSpec,
-        instance0 @Show @NixHell.FlakeGraph,
-        instance0 @Eq   @NixHell.FlakeGraph,
+        instance0 @Show @Value,
+        entail1 @Eq @CI,
+        entail1 @Eq @[],
+        entail1 @Eq @Set,
+        entail1 @Eq @Maybe,
+        entail2 @Eq @Either,
+        entail2 @Eq @(,),
+        entail1 @Eq @Tree,
+        entail1 @Eq @Vector,
         instance0 @Eq @Int,
         instance0 @Eq @Integer,
         instance0 @Eq @Day,
+        instance0 @Eq @DayOfWeek,
         instance0 @Eq @UTCTime,
         instance0 @Eq @TimeOfDay,
         instance0 @Eq @Double,
@@ -854,9 +885,18 @@ instances =
         instance0 @Eq @Text,
         instance0 @Eq @ByteString,
         instance0 @Eq @ExitCode,
+        entail1 @Ord @[],
+        entail1 @Ord @Set,
+        entail1 @Ord @CI,
+        entail1 @Ord @Maybe,
+        entail2 @Ord @Either,
+        entail2 @Ord @(,),
+        entail1 @Ord @Tree,
+        entail1 @Ord @Vector,
         instance0 @Ord @Int,
         instance0 @Ord @Integer,
         instance0 @Ord @Day,
+        instance0 @Ord @DayOfWeek,
         instance0 @Ord @UTCTime,
         instance0 @Ord @TimeOfDay,
         instance0 @Ord @Double,
@@ -876,6 +916,7 @@ instances =
         instance0 @Functor @Tree,
         instance0 @Functor @Options.Parser,
         instance1 @Functor @Either,
+        instance1 @Functor @(,), -- Functor (a,)
         instance0 @Applicative @IO,
         instance0 @Applicative @Maybe,
         instance0 @Applicative @[],
@@ -884,14 +925,40 @@ instances =
         instance1 @Applicative @Either,
         instance0 @Alternative @Options.Parser,
         instance0 @Alternative @Maybe,
+        entail1 @Monoid @Maybe,
         instance0 @Monoid @Text,
+        instance0 @Monoid @Builder,
         instance1 @Monoid @Vector,
         instance2 @Monoid @Options.Mod,
         instance1 @Monoid @[],
+        entail1 @Semigroup @Maybe,
+        instance2 @Semigroup @Either,
         instance2 @Semigroup @Options.Mod,
+        instance1 @Semigroup @Options.InfoMod,
         instance0 @Semigroup @Text,
+        instance0 @Semigroup @Builder,
         instance1 @Semigroup @Vector,
-        instance1 @Semigroup @[]
+        instance1 @Semigroup @[],
+        instance0 @FoldCase @Text,
+        instance0 @FoldCase @ByteString,
+        -- NixHell types
+        instance0 @Show @NixHell.StorePath,
+        instance0 @Eq   @NixHell.StorePath,
+        instance0 @Ord  @NixHell.StorePath,
+        instance0 @Show @NixHell.NixHash,
+        instance0 @Eq   @NixHell.NixHash,
+        instance0 @Ord  @NixHell.NixHash,
+        instance0 @Show @NixHell.Derivation,
+        instance0 @Eq   @NixHell.Derivation,
+        instance0 @Ord  @NixHell.Derivation,
+        instance0 @Show @NixHell.Flake,
+        instance0 @Eq   @NixHell.Flake,
+        instance0 @Show @NixHell.NixExpr,
+        instance0 @Eq   @NixHell.NixExpr,
+        instance0 @Show @NixHell.DerivationSpec,
+        instance0 @Eq   @NixHell.DerivationSpec,
+        instance0 @Show @NixHell.FlakeGraph,
+        instance0 @Eq   @NixHell.FlakeGraph
       ]
 
 --------------------------------------------------------------------------------
@@ -915,6 +982,30 @@ instance1 =
     toDyn $ D1 @c @t Dict
   )
 
+-- A very restricted kind of entailment: C a => C (t a)
+-- This serves:
+-- Eq a => Eq [a], Ord a => Ord (Maybe [a]), etc.
+--
+-- Lookup process:
+--   class = Ord
+--   type  = Maybe [Int]
+--   find (Ord,Maybe)
+--     recurse
+--       find (Ord,[])
+--       recurse
+--          find (Ord,Int)
+--          ==> Ord Int
+--       ==> Ord [Int]
+--   ==> Ord (Maybe [Int])
+entail1 ::
+  forall {k1} (c :: k1 -> Constraint) (t :: k1 -> k1).
+  ((forall a. c a => c (t a)), Typeable c, Typeable t,  Typeable k1) =>
+  ((SomeTypeRep, SomeTypeRep), Dynamic)
+entail1 =
+  ( (SomeTypeRep $ typeRep @c, SomeTypeRep $ typeRep @t),
+    toDyn $ ED1 @c @t (Sub Dict)
+  )
+
 instance2 ::
   forall {k0} {k1} {k2} (c :: k2 -> Constraint) (t :: k0 -> k1 -> k2).
   ((forall a b. c (t a b)), Typeable c, Typeable t, Typeable k0, Typeable k1, Typeable k2) =>
@@ -922,6 +1013,16 @@ instance2 ::
 instance2 =
   ( (SomeTypeRep $ typeRep @c, SomeTypeRep $ typeRep @t),
     toDyn $ D2 @c @t Dict
+  )
+
+-- Same as entail1, but for 2-ary types like Either.
+entail2 ::
+  forall {k1} (c :: k1 -> Constraint) (t :: k1 -> k1 -> k1).
+  ((forall a b. (c a, c b) => c (t a b)), Typeable c, Typeable t, Typeable k1) =>
+  ((SomeTypeRep, SomeTypeRep), Dynamic)
+entail2 =
+  ( (SomeTypeRep $ typeRep @c, SomeTypeRep $ typeRep @t),
+    toDyn $ ED2 @c @t (Sub Dict)
   )
 
 --------------------------------------------------------------------------------
@@ -943,11 +1044,21 @@ resolve1 ::
   TypeRep t ->
   Instances ->
   Maybe (Dict (c (t a)))
-resolve1 _ c t (Instances m) = do
+resolve1 cta c t (Instances m) = do
   Dynamic rep dict <- Map.lookup (SomeTypeRep c, SomeTypeRep t) m
-  Type.HRefl <- Type.eqTypeRep rep $ Type.App (Type.App (typeRep @D1) c) t
-  let D1 d = dict
-  pure d
+  (do Type.HRefl <- Type.eqTypeRep rep $ Type.App (Type.App (typeRep @D1) c) t
+      let D1 d = dict
+      pure d) <|>
+    -- When we see e.g. C (T A), where T A and A have the same kind,
+    -- we can lookup C A, for the entailment C A :- C (T A).
+    (do case cta of
+          Type.App _c a@(Type.App f a') -> do
+            Type.HRefl <- Type.eqTypeRep (typeRepKind a') (typeRepKind a)
+            Type.HRefl <- Type.eqTypeRep rep $ Type.App (Type.App (typeRep @ED1) c) f
+            let ED1 entailment = dict
+            dictA <- lookupDict a' c
+            pure $ mapDict entailment dictA
+          _ -> Nothing)
 
 -- Resolve an instance of the form: Monoid (Mod f a)
 resolve2 ::
@@ -958,11 +1069,23 @@ resolve2 ::
   TypeRep t ->
   Instances ->
   Maybe (Dict (c (t a b)))
-resolve2 _ c t (Instances m) = do
+resolve2 cta c t (Instances m) = do
   Dynamic rep dict <- Map.lookup (SomeTypeRep c, SomeTypeRep t) m
-  Type.HRefl <- Type.eqTypeRep rep $ Type.App (Type.App (typeRep @D2) c) t
-  let D2 d = dict
-  pure d
+  (do Type.HRefl <- Type.eqTypeRep rep $ Type.App (Type.App (typeRep @D2) c) t
+      let D2 d = dict
+      pure d) <|>
+    -- When we see e.g. C (T A), where T A and A have the same kind,
+    -- we can lookup C A, for the entailment C A, C B :- C (T A B).
+    (case cta of
+       Type.App _c a@(Type.App (Type.App f a') b') -> do
+         Type.HRefl <- Type.eqTypeRep (typeRepKind a') (typeRepKind a)
+         Type.HRefl <- Type.eqTypeRep (typeRepKind b') (typeRepKind a)
+         Type.HRefl <- Type.eqTypeRep rep $ Type.App (Type.App (typeRep @ED2) c) f
+         Dict <- lookupDict a' c
+         Dict <- lookupDict b' c
+         let ED2 (Sub d) = dict
+         pure d
+       _ -> Nothing)
 
 --------------------------------------------------------------------------------
 
@@ -1606,24 +1729,27 @@ supportedTypeConstructors =
       ("()", SomeTypeRep $ typeRep @()),
       ("Handle", SomeTypeRep $ typeRep @IO.Handle),
       ("Day", SomeTypeRep $ typeRep @Day),
+      ("DayOfWeek", SomeTypeRep $ typeRep @DayOfWeek),
       ("UTCTime", SomeTypeRep $ typeRep @UTCTime),
       ("TimeOfDay", SomeTypeRep $ typeRep @TimeOfDay),
+      ("Builder", SomeTypeRep $ typeRep @Builder),
+      ("CI", SomeTypeRep $ typeRep @CI),
+      -- NixHell types
+      ("StorePath", SomeTypeRep $ typeRep @NixHell.StorePath),
+      ("Secret", SomeTypeRep $ typeRep @NixHell.Secret),
+      ("NixHash", SomeTypeRep $ typeRep @NixHell.NixHash),
+      ("Derivation", SomeTypeRep $ typeRep @NixHell.Derivation),
+      ("Flake", SomeTypeRep $ typeRep @NixHell.Flake),
+      ("NixExpr", SomeTypeRep $ typeRep @NixHell.NixExpr),
+      ("DerivationSpec", SomeTypeRep $ typeRep @NixHell.DerivationSpec),
+      ("FlakeGraph", SomeTypeRep $ typeRep @NixHell.FlakeGraph),
       -- Internal, hidden types
       ("hell:Hell.NilL", SomeTypeRep $ typeRep @('NilL)),
       ("hell:Hell.ConsL", SomeTypeRep $ typeRep @('ConsL)),
       ("hell:Hell.Variant", SomeTypeRep $ typeRep @Variant),
       ("hell:Hell.Record", SomeTypeRep $ typeRep @Record),
       ("hell:Hell.Tagged", SomeTypeRep $ typeRep @Tagged),
-      ("hell:Hell.Nullary", SomeTypeRep $ typeRep @Nullary),
-      ("StorePath", SomeTypeRep $ typeRep @NixHell.StorePath),
-      ("Secret", SomeTypeRep $ typeRep @NixHell.Secret),
-      ("NixHash", SomeTypeRep $ typeRep @NixHell.NixHash),
-      ("Derivation", SomeTypeRep $ typeRep @NixHell.Derivation),
-      ("Flake",       SomeTypeRep $ typeRep @NixHell.Flake),
-      -- Phase 2 additions
-      ("NixExpr",       SomeTypeRep $ typeRep @NixHell.NixExpr),
-      ("DerivationSpec", SomeTypeRep $ typeRep @NixHell.DerivationSpec),
-      ("FlakeGraph",    SomeTypeRep $ typeRep @NixHell.FlakeGraph)    
+      ("hell:Hell.Nullary", SomeTypeRep $ typeRep @Nullary)
     ]
 
 -- | Used for constructors with no slot. E.g. True :: Nullary -> Bool
@@ -1650,8 +1776,10 @@ supportedLits =
       lit' "Text.setStdin" t_setStdin,
       -- Dates
       lit' "Day.fromGregorianValid" Time.fromGregorianValid,
+      lit' "Day.toGregorian" Time.toGregorian,
       lit' "Day.addDays" Time.addDays,
       lit' "Day.diffDays" Time.diffDays,
+      lit' "Day.dayOfWeek" Time.dayOfWeek,
       lit' "Day.iso8601Show" (Text.pack . Time.iso8601Show :: Day -> Text),
       lit' "Day.iso8601ParseM" (Time.iso8601ParseM . Text.unpack :: Text -> Maybe Day),
       -- UTCTime
@@ -1694,10 +1822,11 @@ supportedLits =
       lit' "Text.reverse" Text.reverse,
       lit' "Text.toLower" Text.toLower,
       lit' "Text.toUpper" Text.toUpper,
-      -- Needs Char operations.
-      -- ("Text.any", lit' Text.any),
-      -- ("Text.all", lit' Text.all),
-      -- ("Text.filter", lit' Text.filter),
+      lit' "Text.any" Text.any,
+      lit' "Text.unpack" Text.unpack,
+      lit' "Text.pack" Text.pack,
+      lit' "Text.all" Text.all,
+      lit' "Text.filter" Text.filter,
       lit' "Text.take" Text.take,
       lit' "Text.splitOn" Text.splitOn,
       lit' "Text.takeEnd" Text.takeEnd,
@@ -1782,6 +1911,11 @@ supportedLits =
       lit' "Directory.removeFile" (\x -> Dir.removeFile (Text.unpack x)),
       lit' "Directory.doesFileExist" (\x -> Dir.doesFileExist (Text.unpack x)),
       lit' "Directory.doesDirectoryExist" (\x -> Dir.doesDirectoryExist (Text.unpack x)),
+      lit' "Directory.getHomeDirectory" (fmap Text.pack Dir.getHomeDirectory),
+      lit' "Directory.getFileSize" (\x -> Dir.getFileSize (Text.unpack x)),
+      lit' "Directory.pathIsSymbolicLink" (\x -> Dir.pathIsSymbolicLink (Text.unpack x)),
+      lit' "Directory.getSymbolicLinkTarget" (\x -> fmap Text.pack $ Dir.getSymbolicLinkTarget (Text.unpack x)),
+      lit' "Directory.removeDirectory" (\x -> Dir.removeDirectory (Text.unpack x)),
       -- Process
       lit' "Process.proc" $ \n xs -> proc (Text.unpack n) (map Text.unpack xs),
       lit' "Process.setEnv" $ Process.setEnv @() @() @() . map (bimap Text.unpack Text.unpack),
@@ -1808,6 +1942,20 @@ supportedLits =
       lit' "Options.switch" Options.switch,
       lit' "Options.strOption" (Options.strOption @Text),
       lit' "Options.strArgument" (Options.strArgument @Text),
+      -- Http
+      lit' "Http.run" warp_run,
+      lit' "Http.responseBuilder" Wai.responseBuilder,
+      lit' "Http.responseStream" Wai.responseStream,
+      lit' "Http.responseFile" wai_responseFile,
+      lit' "Http.mkStatus" http_mkStatus,
+      lit' "Http.pathInfo" Wai.pathInfo,
+      lit' "Http.FilePart" Wai.FilePart,
+      lit' "Http.requestHeaders" Wai.requestHeaders,
+      lit' "Http.queryString" Wai.queryString,
+      lit' "Http.getRequestBodyChunk" Wai.getRequestBodyChunk,
+      lit' "Http.consumeRequestBodyStrict" (fmap L.toStrict . Wai.consumeRequestBodyStrict),
+      -- Builder
+      lit' "Builder.byteString" Builder.byteString,
       -- StorePath
       lit' "StorePath.fromText"      NixHell.storePath_fromText,
       lit' "StorePath.toText"        NixHell.storePath_toText,
@@ -2132,6 +2280,7 @@ polyLits =
 
                -- Alternative operations
                "Alternative.optional" (optional) :: forall (f :: Type -> Type) a. (Alternative f) => f a -> f (Maybe a)
+               "Alternative.many" (many) :: forall (f :: Type -> Type) a. (Alternative f) => f a -> f [a]
 
                -- Monadic operations
                "Monad.mapM_" mapM_ :: forall a (m :: Type -> Type). (Monad m) => (a -> m ()) -> [a] -> m ()
@@ -2166,6 +2315,10 @@ polyLits =
                "Exit.die" (Exit.die . Text.unpack) :: forall a. Text -> IO a
                "Exit.exitWith" Exit.exitWith :: forall a. ExitCode -> IO a
                "Exit.exitCode" exit_exitCode :: forall a. a -> (Int -> a) -> ExitCode -> a
+
+               -- CI
+               "CI.foldedCase" CI.foldedCase :: forall s. CI s -> s
+               "CI.mk" CI.mk :: forall s. CI.FoldCase s => s -> CI s
 
                -- Exceptions
                "Error.error" (error . Text.unpack) :: forall a. Text -> a
@@ -2516,6 +2669,18 @@ t_appendFile fp t = ByteString.appendFile (Text.unpack fp) (Text.encodeUtf8 t)
 
 t_readFile :: Text -> IO Text
 t_readFile fp = fmap Text.decodeUtf8 (ByteString.readFile (Text.unpack fp))
+
+-- Same as Warp.run, but with HTTP/2 support disabled.
+-- Stick to HTTP/1.2; simpler, fewer moving parts.
+warp_run :: Int -> Wai.Application -> IO ()
+warp_run p = Warp.runSettings (Warp.setHTTP2Disabled $ Warp.setPort p $ Warp.defaultSettings)
+
+-- No point using ByteString here.
+http_mkStatus :: Int -> Text -> Http.Status
+http_mkStatus i = Http.mkStatus i . Text.encodeUtf8
+
+wai_responseFile :: Http.Status -> Http.ResponseHeaders -> Text -> Maybe Wai.FilePart -> Wai.Response
+wai_responseFile s r f = Wai.responseFile s r (Text.unpack f)
 
 --------------------------------------------------------------------------------
 -- JSON operations
@@ -3117,6 +3282,9 @@ _generateApiDocs = do
         let excludeHidden = filter (not . List.isPrefixOf "hell:Hell." . fst)
         ul_ do
           for_ (excludeHidden $ Map.toList supportedTypeConstructors) typeConsToHtml
+        h2_ "Instances"
+        ul_ do
+          for_ (Map.toList instances.getInstances) instToHtml
         h2_ "Terms"
         let groups =
               excludeHidden $
@@ -3172,6 +3340,38 @@ makeSearchIndex = Json.Array $ typeConstructorsIndex <> litsIndex <> polysIndex
 
 nameToElementId :: String -> Text
 nameToElementId = Text.pack
+
+instToHtml :: ((SomeTypeRep, SomeTypeRep), Dynamic) -> Html ()
+instToHtml ((cls', ty), dyn') =
+  li_ [id_ (nameToElementId name), class_ "searchable"] $ do
+    code_ do
+      em_ "instance "
+      when entailed do
+         strong_ do
+           "("
+           toHtml $ show cls'
+           " a) => "
+      strong_ $ toHtml $ show cls'
+      " "
+      if entailed || foralld
+         then strong_ do
+                "("
+                toHtml $ show ty
+                " a)"
+         else
+            if foralld2
+               then strong_ do
+                "("
+                toHtml $ show ty
+                " a b)"
+               else
+                 strong_ $ toHtml $ show ty
+
+  where name = show cls' ++ " " ++ show ty
+        -- TODO: Use the types rather than this hack.
+        entailed = Text.isPrefixOf "<<ED1" (Text.pack (show dyn'))
+        foralld = Text.isPrefixOf "<<D1" (Text.pack (show dyn'))
+        foralld2 = Text.isPrefixOf "<<D2" (Text.pack (show dyn'))
 
 typeConsToHtml :: (String, SomeTypeRep) -> Html ()
 typeConsToHtml (name, SomeTypeRep rep) =
